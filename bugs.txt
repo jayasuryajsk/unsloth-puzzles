@@ -1,0 +1,785 @@
+Got it! I'll conduct deep research into the Unsloth GitHub repository, analyze the codebase, and focus specifically on the listed unresolved issues. I'll provide a detailed implementation plan for each issue, outlining necessary modifications, dependencies, and best practices for integration.
+
+I'll update you once the research is complete.
+
+# Deep Dive into Unsloth and Implementation Plans for Key Issues
+
+Below we analyze the Unsloth codebase on GitHub and outline detailed plans to address each unresolved issue. For each item, we identify **affected modules/files**, propose **code modifications**, note any **dependencies**, suggest **best practices**, and highlight **challenges or workarounds**. Citations from the Unsloth repository and issues are provided to ground the analysis.
+
+## 1. VLMs Data Collator – Efficient Text & Image Mixing
+
+**Affected Modules:** The vision data collator is implemented in the Unsloth library (likely in `unsloth.trainer` or `unsloth_zoo.vision_utils.py`). The class `UnslothVisionDataCollator` is responsible for preparing batches of mixed text-image data. Currently, it does not gracefully handle examples without images (text-only cases). In fact, the code contains a **TODO** comment indicating that non-image inputs aren’t supported yet ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=It%20seems%20that%20the%20cause,py)). This means if some samples have images and others are text-only, the collator may break or produce incorrect batches. Issue discussions confirm this limitation – the maintainer noted they’re *“still trying to work out the best way for people to do text only (or a mixture of text + images)”* ([Training a Vision Model with Text-only Inputs · Issue #1590 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1590#:~:text=danielhanchen%20%20%20commented%20,66)).
+
+**Proposed Code Modifications:**  
+- **Extend `UnslothVisionDataCollator` to support optional images:** Update the `__call__` method to handle examples with no image content. Instead of assuming each example has exactly one image, allow a flexible number (including zero). One approach is to collect images in a nested list structure per example. For each sample, build `texts` as before (by applying the chat template to get the full concatenated prompt) and gather `images` as a list. If an example has an `"images"` field (e.g., a list of pre-loaded PIL images), include **all** images in that list. If it doesn’t, use a helper (like `process_vision_info`) to extract any image from the messages content (this handles cases where image data is encoded as paths or base64 in the conversation) ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=messages%20%3D%20example%5B,0%5D%20else)) ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=example_images%20%3D%20%5B%5D%20if%20,append%28message%29%20images%20%2B%3D%20example_images%20pass)). Crucially, if an example has **no images**, ensure an empty list (or placeholder) is added for that example. This way, we maintain alignment between text entries and image entries. The collator should then call the Hugging Face processor with `text=[...]` and `images=[list_of_images_per_example]`. Hugging Face’s multi-modal `AutoProcessor` (e.g., for Qwen or LLaVA) can accept a list of lists for images, where an empty sub-list denotes no images for that particular text input. This resolves the mismatch error (“number of image token (2) vs number of provided images (1)” from the issues ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=But%20I%20get%20the%20following,error))) by providing the correct number of image tensors corresponding to `<Image>` tokens in each example’s text. After obtaining the tokenized batch (`inputs = processor(texts, images=..., ...)`), the collator should set up labels for language modeling. Typically, Unsloth clones `batch["input_ids"]` to `labels` and masks out padding with -100. We will continue to do so, but now also ensure that if some examples had no image, it doesn’t disrupt the tensor shapes – the processor’s padding logic will produce tensor placeholders (like zeros) for absent images, which is fine. No special case is needed in the label tensor for “no image” because image inputs don’t correspond to prediction targets (they are just conditioning input). The key is making sure the collator doesn’t crash or mis-align sequences when some `images` lists are empty. An updated pseudo-code for `__call__` might be: 
+
+  ```python
+  def __call__(self, examples):
+      texts = []
+      images_per_example = []
+      for ex in examples:
+          msgs = ex["messages"]
+          # Compose the full conversation text with placeholders
+          text = self.processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+          texts.append(text)
+          # Gather images if any
+          if "images" in ex and len(ex["images"])>0:
+              images_per_example.append(ex["images"])      # use all images provided
+          else:
+              imgs, vids = process_vision_info(msgs)
+              images_per_example.append(imgs if imgs else [])  # imgs is a list (could be empty)
+      # Now tokenize with lists of images (each sub-list aligns to one text)
+      batch = self.processor(text=texts, images=images_per_example, videos=None, return_tensors="pt", padding=True)
+      # (set batch["labels"] appropriately for LM fine-tuning …)
+      return batch
+  ``` 
+
+  This aligns with the fix suggested by a contributor in Issue #1369 ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=def%20__call__%28self%2C%20examples%29%3A%20,message%20%3D%20self.processor.apply_chat_template%28%20messages)) ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=example_images%20%3D%20%5B%5D%20if%20,append%28message%29%20images%20%2B%3D%20example_images%20pass)). With this change, the collator will properly handle a mix of text-only and image+text examples in the same batch. No longer will it assume exactly one image per sample; it can have zero, one, or multiple images.  
+
+- **Preserve image-token alignment:** When using the Hugging Face processor, it’s important that the special `<image>` tokens in the text are correctly paired with actual image tensors. By passing a nested list of images, the `processor` will insert the appropriate number of `<Image>` tokens for each sub-list and encode the images accordingly. We should verify this with a small test (e.g., one example with 2 images, another with 0) to ensure the outputs make sense. The Unsloth collator already uses `tokenizer.apply_chat_template` to inject the proper format (including placeholders), so our job is to feed the images in a matching structure ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=messages%20%3D%20example%5B,0%5D%20else)) ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=example_images%20%3D%20%5B%5D%20if%20,append%28message%29%20images%20%2B%3D%20example_images%20pass)). 
+
+- **Adjust internal comments and remove the outdated TODO:** After implementing, update or remove the `# [TODO] Support non image inputs` comment ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=def%20__call__%28self%2C%20examples%29%3A%20,messages)) and add documentation indicating that text-only, image-only (if ever needed), and mixed inputs are now supported. This will prevent confusion for future contributors.
+
+**Dependencies/Libraries:** This improvement leverages Hugging Face’s multi-modal tokenization pipeline (via `AutoProcessor` or model-specific processor like Qwen’s). We rely on `transformers` internals to handle images. Ensure that the Hugging Face version used supports list-of-lists for images (the Qwen and LLaVA processors do support multiple images per sample as of their latest versions ([unsloth/Qwen2.5-VL-72B-Instruct · Hugging Face](https://huggingface.co/unsloth/Qwen2.5-VL-72B-Instruct#:~:text=,)) ([unsloth/Qwen2.5-VL-72B-Instruct · Hugging Face](https://huggingface.co/unsloth/Qwen2.5-VL-72B-Instruct#:~:text=texts%20%3D%20,text%3Dtexts%2C%20images%3Dimage_inputs%2C%20videos%3Dvideo_inputs%2C%20padding%3DTrue))). We also use PIL (Pillow) for image objects if not already, but Unsloth likely already requires it for vision datasets. No new major external library is needed beyond what Unsloth already uses (Hugging Face Transformers, possibly torchvision if using that for image loading).
+
+**Best Practices for Integration:** Test the new collator on various scenarios:
+- All examples have one image (regression test to ensure no performance loss or breakage).
+- Some examples have no image (text-only) – these should now tokenize without error and simply have no `<Image>` token.
+- Some have multiple images (e.g., Qwen supports multi-image queries). The batch should correctly include all images and produce the right number of `<Image>` tokens. The fix from Issue #1369 ensures multi-image works ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=But%20I%20get%20the%20following,error)) ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=example_images%20%3D%20%5B%5D%20if%20,append%28message%29%20images%20%2B%3D%20example_images%20pass)). 
+Additionally, ensure that the **order** of images in each example’s list corresponds to the order of `<Image>` placeholders in the text template. (Usually, the chat template inserts placeholders in the same order as images appear in the user message content). Document how to prepare the dataset dictionary for this collator – e.g., if using Hugging Face `datasets`, one might have a column of images and need to map them into the `"images"` field or into the message content with indices. Providing an example in the README or wiki for mixing text and images would help users.  
+Performance-wise, consider pre-processing images (resizing, normalization) before collator if not already handled by the `processor` – though we will address resizing in the next issue.
+
+**Potential Challenges & Workarounds:** Handling **no-image examples** in a batch with image examples is tricky because the Hugging Face processor might expect a corresponding dummy entry. The approach of using empty lists in `images_per_example` should work; if it doesn’t (say the processor insists on an image tensor), a workaround is to insert a black image or a small dummy image for those cases, and rely on the model to ignore it since no `<Image>` token was actually in the text. However, Qwen’s processor should allow empty lists (as suggested by their documentation of `min_pixels`/`max_pixels` handling variable image sizes). Another challenge is ensuring this change doesn’t degrade speed – iterating through each example in Python could be a bit slow. But given batch sizes for large models are usually small (1–4), this is acceptable. If performance becomes an issue, we could vectorize some operations or move certain steps (like applying the chat template) into the dataset map function rather than collator. Finally, careful attention is needed to **multiple image** scenarios: as one contributor noted, LLaMA-based vision models (like Llama-3.2-Vision) might not natively support multi-image input even if Qwen does ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=Loading)). We should clarify model capabilities. For those that only support one image at a time, the collator can still handle multiple by concatenating them (as separate turns or ignoring extras), but that’s beyond scope – likely Unsloth will document that certain models ignore additional images. In summary, by making the collator robust to `len(example["images"]) != 1`, we support efficient mixing of text-only and image-conditioned examples in training batches, resolving the current limitation.
+
+## 2. VLMs Image Resizing – Configurable Maximum Image Size for VRAM Optimization
+
+**Affected Modules:** The image preprocessing pipeline in Unsloth’s vision models and data collator is the focus here. Currently, images may be processed at the model’s default resolution, which could be large (e.g., Qwen-VL uses 448×448 by default ([Qwen-VL - Hugging Face](https://huggingface.co/Qwen/Qwen-VL#:~:text=Qwen,VL))). We need to allow the fine-tuner to specify a max image size (width/height) or automatically use a size from the model’s `config.json` (if available) to resize all images before batching. The relevant code likely lives in the collator or the Hugging Face `processor` object used by Unsloth. For example, Qwen’s `AutoProcessor` supports parameters `min_pixels` and `max_pixels` to control resizing ([unsloth/Qwen2-VL-72B-Instruct · Hugging Face](https://huggingface.co/unsloth/Qwen2-VL-72B-Instruct#:~:text=match%20at%20L549%201,range%20of%20min_pixels%20and%20max_pixels)). If Unsloth is using `processor = AutoProcessor.from_pretrained(...)` for vision models, we can leverage that. Also, Unsloth’s `FastVisionModel.from_pretrained` might be involved in setting up model-specific transforms. We might also consider `unsloth_zoo.vision_utils` if it contains custom image transforms.
+
+**Proposed Code Modifications:**  
+- **Expose an `image_size` or `max_image_pixels` parameter:** We will update Unsloth’s training configuration to accept a maximum image dimension. This can be done by adding an argument to the `UnslothVisionDataCollator` initializer (e.g., `max_image_size=None` or `max_pixels=None`). If provided, we will programmatically set the processor’s resizing parameters. For Qwen, for instance, one could do: `processor = AutoProcessor.from_pretrained(model_name, max_pixels=some_value)`. Qwen’s documentation indicates two ways to control image size: by pixel count range or by explicit dimensions ([unsloth/Qwen2-VL-72B-Instruct · Hugging Face](https://huggingface.co/unsloth/Qwen2-VL-72B-Instruct#:~:text=1,range%20of%20min_pixels%20and%20max_pixels)). We should support both if possible:
+  - **Max pixels approach:** Calculate `max_pixels = max_size * max_size` (assuming square target for simplicity, or take into account aspect if preserving ratio). For example, to cap images at 224×224, use `max_pixels = 224*224`. We might also set `min_pixels` to a reasonable floor (or leave it as default).
+  - **Exact dimensions approach:** Some models might allow `resized_height` and `resized_width` in the processor. If using those, ensure both are set to `max_size`. The `QwenProcessor` for instance allows specifying `resized_height` and `resized_width` as an alternative to pixel count ([unsloth/Qwen2-VL-72B-Instruct · Hugging Face](https://huggingface.co/unsloth/Qwen2-VL-72B-Instruct#:~:text=2,and)).
+- **Modify image preprocessing pipeline:** If Unsloth uses the Hugging Face processor, setting those parameters at init time might suffice (the processor will handle resizing each image on encoding). For example, in a Qwen 2.5 model card, they demonstrate: `processor = AutoProcessor.from_pretrained(..., min_pixels=..., max_pixels=...)` to ensure images are scaled to that range ([unsloth/Qwen2-VL-72B-Instruct · Hugging Face](https://huggingface.co/unsloth/Qwen2-VL-72B-Instruct#:~:text=match%20at%20L578%20,Describe%20this%20image)). We should integrate a similar call in `FastVisionModel.from_pretrained` or right before training. Concretely, if `max_image_size` is given, compute appropriate `max_pixels` and reinitialize or configure the processor with it. If Unsloth presently doesn’t expose the processor creation (maybe it’s hidden inside model loading), we can instead perform resizing in the collator manually:
+  - Use Pillow to resize the PIL images in each example to the specified max dimensions. For each image, do `image.thumbnail((max_w, max_h))` or `image.resize((max_w, max_h), resample=Resampling.BILINEAR)`. If preserving aspect ratio, `thumbnail` will shrink the image such that neither width nor height exceed the max. It’s usually best to preserve aspect ratio (to avoid distortion) and let the model’s vision encoder (which often does center-cropping or padding) handle any slight differences. Alternatively, one could crop or pad to exact square – but most foundation models accept non-square after resizing (they often center-crop internally). Since Qwen specifically mentions maintaining aspect ratio within min/max range ([unsloth/Qwen2-VL-72B-Instruct · Hugging Face](https://huggingface.co/unsloth/Qwen2-VL-72B-Instruct#:~:text=is%204,max_pixels%20%3D%201280%2A28%2A28)), following that approach is wise.
+  - After resizing via PIL, pass the processed image to the tokenizer/processor. This ensures that the pixel count is bounded, saving VRAM. We should do this **before** converting images to tensors. For efficiency, perform resizing once per image in the collator loop.
+- **Auto-detect from `config.json`:** Many vision-enabled model configs might include a recommended image size. For example, a LLaVA model config might have `"vision_config": {"image_size": 224}` or Qwen’s might list something like image resolution. We can attempt: `size = getattr(model.config, "vision_config", {}).get("image_size", None)` or check `model.config.resolution` if present. If found, use that as default max size. (Qwen’s config likely doesn’t hardcode one since it allows flexible, but LLaMA-vision possibly does). If config doesn’t specify, we could default to a safe value (like 224 or 384) or the original pre-training resolution of the model (for Qwen, 448). Since the issue asks to allow specification **or** use config, we implement both: the user can manually override via an argument, otherwise we try model config’s value.
+- **Integrate with training scripts:** In Unsloth’s training CLI or notebooks, add a parameter (e.g., `--max_image_size 224`). Pass this to the data collator or processor setup. Update documentation so users know they can set it to reduce VRAM usage – smaller images mean fewer patches and lower memory consumption in the vision encoder (at some possible cost to accuracy if too small).
+
+**Dependencies:** We rely on **Pillow (PIL)** for image resizing if doing it manually. This is already a dependency for datasets with images. If using Hugging Face’s `AutoProcessor` resizing, ensure `transformers` is up-to-date (v4.33+ for Qwen’s processor with `max_pixels` support). No other new libraries needed. If the user runs on Colab, note that large image resizing in Python is fine given typically small batch sizes.
+
+**Best Practices:**  
+- **Maintain aspect ratio:** Avoid simply squashing images to a fixed square by width/height, as that might degrade performance (unless the model explicitly expects square inputs). It’s better to resize such that the longer side = `max_size` and pad the shorter side if needed. However, huggingface processors often do this for us: for example, `max_pixels` ensures area is limited but keeps aspect, and some processors might pad to a square. We should confirm how each model’s processor works. If not using the processor’s internal logic, implement a consistent strategy (e.g., scale and center-pad to a square). A good practice is to match the model’s original training procedure: if LLaMA-3.2-Vision was trained on 224×224 cropped images, then enforcing a 224 size (with center crop) at fine-tuning is ideal. Qwen-VL was trained with variable sizes up to 448, so one might choose a smaller cap for fine-tuning to save memory (say 336 or 224) – but the model might then see images at a resolution distribution different from pre-training. We should caution users about this trade-off.
+- **Update `config.json` or logs:** It may be useful to record the image size used for fine-tuning. If we dynamically override the processor, perhaps set an attribute in `model.config` (like `model.config.finetune_image_size = X`) for reference. At minimum, log the chosen max size at the start of training for clarity.
+- **Test memory usage:** To ensure VRAM optimization, test a batch with and without resizing. For example, if a model normally processes 448px images and uses, say, 12GB VRAM for batch 1, resizing to 224px should significantly drop memory (since number of pixels ~ quarter). Verify that difference. If using PyTorch’s memory stats, ensure no hidden overhead. This confirms the feature’s value.
+- **Integration with collator pipeline:** If using the Hugging Face processor to resize, make sure not to *also* manually resize, to avoid double-scaling. Pick one method (preferably the processor’s built-in, as it’s likely optimized in C++ and ensures consistency with model normalization). When calling `processor(..., images=...)`, it will apply its internal transforms (like resize, normalize, maybe center crop). Thus, if we set `max_pixels`, it will handle resizing automatically each call. This is cleaner than manual PIL in collator, and keeps augmentations consistent. For models like LLaMA-vision that might not have an `AutoProcessor`, manual resizing is fine.
+
+**Potential Challenges & Workarounds:**  
+- *Different models, different expectations:* Not all VLMs use the same image size. Qwen-VL supports a wide range (with attention scaling accordingly). LLaMA-3.2-Vision might have a fixed ViT encoder expecting 224 or 240 patches. PixTrAL (the Mistral-based vision model) might use Mistral’s image patching logic. We must ensure our resizing does not violate model assumptions. For example, if a model was pre-trained on 224px images with positional embeddings for a 14x14 patch grid, feeding a 448px image would introduce mismatched positional embeddings – but our direction is opposite (reducing size), which generally is safe (model sees fewer patches than it could handle, but that’s like cropping/padding). A possible workaround: read the model’s vision backbone config (if model has a `vision_model` or similar attribute). If the model has absolute position embeddings of fixed length for patches, stick to that length. If using relative positional embeddings (like many recent ones), it’s flexible.
+- *Triton or TorchScript issues:* If using torch.compile or other accelerators, dynamic image shapes could trigger recompilation. Setting a fixed max size helps by capping shapes, but if aspect ratio varies, the number of patches varies per image, possibly causing shape variations across batches. To avoid excessive recompilation in compiled mode, we might consider **padding all images to the same dimensions** after resizing. For instance, determine a target (max_height, max_width) = (max_size, max_size) if we choose square, and pad all images to exactly that. This ensures the tensor shape for image inputs is consistent, preventing compile misses. The slight downside is extra padding computation, but it’s usually minor compared to overall model compute. This approach is aligned with the next issue (Flex Attention and packed sequences) – dynamic shapes can be tricky, so sometimes making them uniform via padding is preferable.
+- *User error and documentation:* If we allow user to set an arbitrary max size, they might pick something too low (making the task too hard for the model) or too high (negating the VRAM benefit). We should provide guidance: e.g., “We recommend using 224 for LLaVA-based, 336 for Qwen if memory is constrained, etc.” If `config.json` has a value, that’s a safe default. Perhaps print a warning if user sets a value larger than model’s pre-training resolution.
+- *Integration with Issue #1 (collator changes):* After resizing, the rest of collator logic remains the same. One must ensure that our resizing code and the multi-image logic don’t conflict. For example, if we get a list of images for an example, we must resize **each** image in that list. This means if an example has multiple images, loop through them to resize. If using `AutoProcessor` with `max_pixels`, it will handle each image in the list appropriately (likely resizing each). It’s prudent to test multi-image + resizing combination.
+- *Quality impact:* Reducing image size might affect model accuracy. If the fine-tuning dataset images are large (e.g., high-res screenshots or documents) and we downscale too much, the model may struggle. If possible, as a workaround, one could allow **bigger** images than default too (if VRAM permits) by specifying a higher `max_image_size` – our code should allow that (e.g., user wants to fine-tune Qwen at 640px for better detail, as long as GPU can handle it). So naming it “max” is good, it can also function as a target size if larger than default. We just pass the chosen size to processor.
+- *Backward compatibility:* On Windows (addressed later) or environments where PIL might behave differently, ensure resizing works consistently (PIL is generally fine across OS). If the model’s processor uses `opencv` or `torchvision` for resizing (some do if installed), that’s okay; just ensure those libs are available or fall back to PIL (Hugging Face typically falls back to PIL if cv2 not present).
+  
+By implementing configurable image resizing, we optimize memory usage for vision-language fine-tuning. This allows users to train larger batches or larger models on the same hardware by trading off some image detail – a practical knob for fine-tuning VLMs.
+
+## 3. GGUF Vision Support – Exporting Vision-Fine-tuned Models to GGUF Format
+
+**Affected Modules:** Unsloth’s model saving/export pipeline is affected. Unsloth already supports exporting language-only fine-tunes to GGUF (the llama.cpp format) ([GitHub - unslothai/unsloth: Finetune Llama 3.3, DeepSeek-R1 & Reasoning LLMs 2x faster with 70% less memory! ](https://github.com/unslothai/unsloth#:~:text=All%20notebooks%20are%20beginner%20friendly%21,or%20uploaded%20to%20Hugging%20Face)) ([GitHub - unslothai/unsloth: Finetune Llama 3.3, DeepSeek-R1 & Reasoning LLMs 2x faster with 70% less memory! ](https://github.com/unslothai/unsloth#:~:text=Llama%203,less)), but vision models pose a new challenge. The relevant code likely resides in Unsloth’s save utilities (`unsloth_cli.py` or `unsloth.models._utils` where functions to save to GGUF or invoke llama.cpp conversion might exist). In the repository’s release notes, there are references to GGUF saving fixes ([Releases · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/releases#:~:text=Llama,cmake)) ([Releases · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/releases#:~:text=,1379)) and contributions like “Fix llama.cpp GGUF by @danielhanchen in #1375”, indicating the code path for saving to GGUF was updated recently. We need to extend this pipeline to handle models that have vision components (like LLaMA-3.2-11B-Vision, Qwen-VL, PixTrAL). Ensuring *compatibility with Llava and Qwen VL* means the exported file should include the necessary weights and be usable (or at least not break) in inference frameworks that support those model types.
+
+**Proposed Code Modifications:**  
+- **Extend the GGUF conversion script to include vision encoders:** If the model has a vision sub-module, we must decide how to represent it in the GGUF file. The GGUF format (used by llama.cpp) primarily knows about the transformer weights for text generation. It doesn’t natively have a specification for a vision encoder. However, there are a couple of strategies:
+  - *Approach A: Merge the vision encoder into the transformer as pseudo-weights.* For example, Llava-style models often have a projection matrix that maps CLIP image features into the LLM’s embedding space. If the vision encoder was frozen, fine-tuning might only adjust that projection. We could merge the projection weights into the token embedding matrix for special image tokens. Concretely, define a special token (or tokens) in the vocabulary that stand for the image input. Then, in the GGUF model’s token embedding matrix, place the learned projection such that those token IDs will produce the same embedding as the image encoder + projection would have. This is complex and only feasible if the image encoder is fixed and known (not fine-tuned). If Unsloth fine-tunes the entire vision tower (as it allows `finetune_vision_layers=True` in LoRA ([Fine-Tuning Llama 3.2 Vision | DataCamp](https://www.datacamp.com/tutorial/fine-tuning-llama-3-2-vision#:~:text=changes%20to%20the%20original%20architecture))), we have new weights in the vision backbone too.
+  - *Approach B: Store vision weights as custom metadata in GGUF.* The GGUF format is extensible – it can include auxiliary data blobs. We could insert the entire vision encoder’s state dict as an extra GGUF section (for example, as “vision_encoder” tensor block). It wouldn’t be used by vanilla llama.cpp (which would just ignore unknown sections), but it ensures the fine-tuned weights are preserved. A specialized fork or future version of llama.cpp could make use of them. This ensures no information is lost. The challenge is that current consumers (llama.cpp, text-generation-webui, etc.) won’t know what to do with these weights – but at least the text portion could be run.
+  - *Approach C: Two-file solution (temporary workaround).* Export the text transformer to GGUF as usual, and separately save the vision encoder (e.g., as a standard Hugging Face `VisionEncoder` or even a GGML for the vision part if there’s a tool for that). The user would then have to handle combining them at runtime manually. This is less ideal from a user standpoint.
+  
+  Ideally, we implement Approach B in code for now (since it doesn’t require altering llama.cpp itself). Concretely, in Unsloth’s `save_to_gguf` function (or wherever it invokes the conversion), detect if the model is a vision model. For detection, check `model.config.model_type` or architecture name – e.g., `"llama"` with a vision tower, or `config.is_encoder_decoder` (some VLMs might be encoder-decoder for image?). Or simply check if `model` has an attribute like `model.vision_tower` or any submodule of type `ViTModel` or `CLIPVisionModel`. For Qwen, the model class might be `QWenVLModel` containing `vision_proj` or similar. Once detected:
+   - Retrieve the full state dict of the model. Separate the weights into two sets: vision-related and text-related. For instance, anything in state keys starting with `"vision_model"` or `"vision_tower"` or `"img_proj"` go to vision set; the rest (transformer layers, LM head, etc.) go to text set.
+   - Use the existing GGUF export routine for the text set as normal. (This likely calls an internal converter or writes weights in the GGUF structure fields for token embeddings, layers, etc. Unsloth might either use a Python conversion or call out to a compiled converter – the release note about using `cmake` suggests they might compile llama.cpp’s converter).
+   - After writing mandatory fields, append new fields for vision. The GGUF format specification (from llama.cpp repo) can be extended with custom tensor names. For example, we could write each vision weight tensor under a prefix like `"VISION/"`. The simplest way: extend the conversion tool to read an optional dictionary of extra tensors to store. If Unsloth’s save code uses something like `llama_cpp_exporter.save(state_dict, file_path)`, we’d modify that function to also take `extra_state_dict` for additional data.
+   - Specifically for **Llava (LLaMA-Adapter)** style: if the only difference is a linear projection matrix (often called `mm_projector` or similar), we can incorporate that easily. We might treat that projection as part of the embedding matrix or as a separate tensor in GGUF. E.g., add a tensor named `"image_projection.weight"` and `"image_projection.bias"`. It won’t be used by llama.cpp currently, but it’s stored.
+   - For **Qwen-VL:** Qwen’s architecture includes an image tokenizer (a Vision Transformer) whose outputs are concatenated to text tokens via special `<Image><\Image>` markers. To be “compatible”, one might aim to have the text model handle `<Image>` tokens as a kind of large embedding vector. Perhaps we store the entire vision transformer weights as a blob. Mark them with keys like `"vision_transformer/<layer_name>"` in GGUF. If a future tool or Qwen’s own deployment tool can load from GGUF, it could extract those. 
+   - It’s worth noting that currently, llama.cpp does **not** support Qwen or other architectures directly. Ensuring *compatibility* here might mean more about format and completeness of weights rather than immediate run-ability in llama.cpp. The phrasing suggests we want the GGUF file to contain everything needed for Llava or Qwen-VL, even if llama.cpp itself might ignore the vision parts. In other words, the exported model should not lose the vision capability if converted back somehow.
+  
+- **Include metadata to identify the model as multi-modal:** The GGUF format allows metadata key-value pairs (like model name, context length, etc.). We should add a flag in the file indicating presence of a vision encoder. Perhaps set a metadata like `"vision_encoder":"present"` or `"vision_encoder_type":"ViT-L/14"`. This could help any tool reading the file to know it’s not a standard LLM. Also store the image resolution used during fine-tuning (from Issue #2) as metadata, so it’s documented.
+
+- **Testing the pipeline:** After coding the above, test with a known model:
+  - Fine-tune a small vision model (maybe use LLaMA-3.2-3B-Vision on a tiny dataset for one step) and call Unsloth’s export to GGUF.
+  - Verify that a GGUF file is produced without errors. Use the `gguf-info` utility (from llama.cpp tools) to list the contents. We expect to see all the transformer weight tensors as usual, plus our added vision tensors or blobs.
+  - Try loading the GGUF in llama.cpp (it will likely skip unknown tensors). It should at least load the text part and be able to run inference on text (though obviously won’t process images on its own). This ensures we didn’t break the format structure. For example, if our added data cause parsing issues, we’d need to adjust (perhaps llama.cpp’s parser might choke if it doesn’t expect certain sections; but typically unknown sections are ignored with a warning).
+  
+- **Hugging Face integration:** Also ensure we still save to Hugging Face format normally (Unsloth likely first saves a Hugging Face model then converts to GGUF). Our changes shouldn’t interfere with the normal `.save_pretrained` for huggingface (which will naturally include vision weights in the checkpoint).
+
+**Dependencies/Libraries:** Unsloth’s GGUF export likely depends on the **llama.cpp conversion code**. Possibly they vendor a copy or require `sentencepiece` and the `gguf` library. The mention of using `cmake` suggests they compile some C++ code for conversion ([Releases · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/releases#:~:text=Llama,cmake)). We may need to update that code if it has assumptions about model dimensions. For example, if it automatically writes a certain number of tokens or layers, we must ensure it can handle the extra. If Unsloth uses the Python path (e.g., via the `transformers` library’s integration with llamacpp – however, as of now, Transformers doesn’t have native gguf export, only older ggml for Llama), likely they have a custom solution. We might need to modify a C++ converter in the repository. If so, ensure to include logic to handle additional tensor categories for vision. If such changes are complex, an interim solution is to *not crash* and simply not include vision weights. But since the issue calls for enabling it, we proceed with integration. Dependencies like **numpy** will be used to format weights if done in Python. Also ensure **protobuf or struct** usage for binary writing (if any) can handle large data (some vision encoders are big – e.g., CLIP ViT-L/14 is ~300M params, which added to a 7B LLM might make a ~7.3B param combined model, still fine, just ensure file writing handles it).
+
+**Best Practices:**  
+- **Quantize vision weights appropriately:** GGUF typically contains quantized weights (e.g., 4-bit or 8-bit). The text model gets quantized when exporting (since that’s the point – to run efficiently). For vision weights, if we include them, we should also consider quantizing them to keep file size reasonable. E.g., represent the vision encoder’s linear layers in 8-bit or 16-bit in the file. However, if llama.cpp doesn’t use them, quantization is not strictly necessary. It might be safer to store them in full-fp16 to avoid any misinterpretation. We could mark them differently. Perhaps store them as `float16` or `float32` in GGUF (the format supports multiple dtypes). As a best practice, do not mix them into the main quantization routine for LLM weights (that routine might assume a certain shape that vision conv weights don’t have). Instead, handle vision weights separately (store as auxiliary data).
+- **Maintain compatibility with non-vision models:** Ensure that the changes do not affect exporting regular LLMs. E.g., the export function should first detect if vision present; if not, proceed exactly as before. All additional logic should be behind an `if vision:` guard.
+- **Inform users how to use the GGUF:** Document that the output .gguf for a multimodal model includes the vision weights but that currently there is no one-click way to use it with llama.cpp. However, advanced users or future tools could load it. One could imagine writing a small wrapper to use llama.cpp for text and a separate image pipeline for vision, combining them. For instance, for Llava, one could use OpenCV/PIL to preprocess an image, run it through CLIP (with weights from our file) to get image embeddings, then feed those as special tokens into llama.cpp text model. These steps are outside Unsloth, but we should make sure the weights are accessible. Perhaps we include a script to extract the vision weights from the GGUF back into a PyTorch model (so that if someone only has the .gguf they can recover a usable HF vision checkpoint).
+- **Cross-compatibility with Ollama or vLLM:** Unsloth mentions support for exporting to Ollama and vLLM as well ([GitHub - unslothai/unsloth: Finetune Llama 3.3, DeepSeek-R1 & Reasoning LLMs 2x faster with 70% less memory! ](https://github.com/unslothai/unsloth#:~:text=All%20notebooks%20are%20beginner%20friendly%21,or%20uploaded%20to%20Hugging%20Face)). If similar issues exist there for vision, we should consider them. For example, **Ollama** (which uses GGML/GGUF under the hood) might ignore vision too. If we handle GGUF properly, Ollama likely benefits automatically. **vLLM** (a library for fast inference) uses Hugging Face weights directly, so as long as the model is a standard HF format with vision, vLLM can’t directly utilize vision either (it’s text only). So focus on GGUF primarily.
+- **Model identifiers:** Some vision models might use custom architecture names that the converter doesn’t know. For instance, a Qwen-VL might not be recognized as Llama family. We might have to force certain settings (e.g., Qwen has a different rotary embedding base, etc.). Since GGUF is primarily for Llama variants, exporting Qwen to GGUF might require us to masquerade it as a Llama-like model (which is risky since Qwen’s architecture is not identical). If full compatibility is too hard, we could limit initial support to LLaVA-style models (Llama with vision adapter). Qwen-VL’s compatibility could be marked experimental, where we at least dump weights but note that llama.cpp cannot run it yet. The issue specifically names Qwen VL, so likely the aim is to allow saving it in some form. We’ll ensure we *can* serialize Qwen’s weights into a .gguf file: treat Qwen’s text transformer like any other (it’s decoder-only, similar enough to GPT-NeoX/LLama), and include Qwen’s vision MLP or gating as extra. We should also store Qwen’s extended vocabulary (it has special tokens for <Image>, etc.) in the GGUF. The conversion should include those extra tokens in the vocab metadata so that the `<Image>` token ID is preserved. (If not, generation with llama.cpp would misalign token IDs). So, ensure when exporting Qwen, the tokenizer’s vocab (which may have 1-2 special tokens for images or bounding-box tags) is written fully.
+
+**Potential Challenges & Workarounds:**  
+- *Llama.cpp limitations:* As noted, currently llama.cpp doesn’t perform vision processing. After our changes, loading a vision-GGUF model into llama.cpp will result in a model that can generate text, but if you prompt it with the `<Image>` token, it will likely treat it as just another token (because the vision encoder isn’t actually being invoked). One workaround (outside Unsloth’s scope) is a future update to llama.cpp where one could plug in a callback for `<Image>` tokens – e.g., llama.cpp could detect that token and call an external image encoder. We can pave the way by making sure the GGUF contains the image encoder weights, so that future implementations have what they need. For now, we explicitly warn that tool support is limited: essentially, **the exported model is mainly for safekeeping of weights or partial text-only usage**.
+- *File size:* Including a vision encoder will increase the .gguf file size significantly. E.g., a 7B model with a CLIP ViT encoder (~1B params) in FP16 will produce a file ~16GB if unquantized. With 4-bit quantization on the 7B and no quantization on the vision, maybe ~4GB. That’s still large but manageable. If this is a concern, we could optionally quantize the vision to 8-bit. We have to balance compatibility – quantizing convolutional weights might reduce accuracy if we ever reload them. Perhaps provide an option `--quantize_vision` if user truly wants to shrink it. Otherwise, accept larger file as the cost of completeness.
+- *Complex architectures:* If a model like BLIP-2 (which has separate vision encoder, Q-Former, and LLM) were fine-tuned via Unsloth, exporting that to a single GGUF would be very complex. Fortunately, Unsloth’s scope is primarily LLaMA-based and Qwen-based VLMs, which are more straightforward (single unified model). We will not attempt something like BLIP-2 (which is encoder-decoder).
+- *Testing on different platforms:* After implementation, test the GGUF export on Linux (primary target). Windows installation of Unsloth might not easily compile the converter (but we address Windows later). We may mark GGUF export as not fully supported on Windows for now, which is acceptable since llama.cpp is mostly used on Linux/Mac for dev or via provided binaries on Windows.
+- *Backward compatibility:* If the Unsloth version with this feature is used to export an older fine-tuned model that had vision LoRA applied, it should handle it. There might be slight differences if LoRA was used (LoRA adds adapters to the state dict). But since we’re grabbing the state dict and dividing into text/vision, LoRA weights would appear alongside base weights. We should merge the LoRA into base before export (likely Unsloth already does this when exporting to GGUF, to produce a standalone model). We must ensure that merging includes vision LoRA parts as well. E.g., if LoRA tuned CLIP ViT layers, those deltas must be merged into the vision weights before writing out. So extend any “merge LORA” logic to vision submodules too (this might happen automatically if we call `model.merge_and_unload()` or similar, but verify).
+- *Qwen specifics:* Qwen-VL has some special handling for image tokens and maybe gating mechanisms. When converting, ensure that:
+  - The vocabulary in GGUF includes the special `<Image>` token (so the text model can at least ingest a placeholder).
+  - Qwen’s rotary embedding base (possibly 10000 vs 100000 for Llama) is correctly set in the GGUF hyperparameters if needed (GGUF stores things like context length, rot basis, etc.). If we don’t set them, the default Llama values might be assumed, which could be wrong for Qwen. Check Qwen’s config for differences and write correct hyperparameters to GGUF metadata (there is a field for RoPE base, etc., in GGUF).
+  - If Qwen’s feed-forward or attention structure differs (e.g., uses RMSNorm instead of LayerNorm, or different gating), verify the converter can handle it. Possibly, since they fine-tune Qwen through Hugging Face, the underlying structure is similar enough to GPT-NeoX (which llama.cpp doesn’t natively support either, but some converters can map GPT-NeoX to Llama format by transposing weights). If necessary, we might internally convert Qwen’s weight names to Llama-like names just for writing GGUF (e.g., split Qwen’s fused QKV into separate Q, K, V if llama.cpp expects that). This is a deep detail – if too involved, we may restrict fully correct GGUF support to Llama family and simply include Qwen weights as-is (with a note that one might not be able to run it until a specialized Qwen runner is available).
+
+In summary, we will **enable Unsloth’s `save_to_gguf` (or similar function) to handle models with vision components**. The text transformer portion will be exported in standard GGUF format, and the vision parameters will be embedded in the file in a way that they are not lost. This fulfills the goal of preserving fine-tuned VLMs in a portable format. Users can then potentially use these with specialized runtimes or for safekeeping/model sharing on Hugging Face (since GGUF is becoming a popular distribution format). Unsloth’s docs should highlight that for now, these GGUFs are mainly for the text generation part unless tools evolve.
+
+## 4. Support Flex Attention – Dynamic Sequence Lengths with Efficient Attention (SWAs, Masks, etc.)
+
+**Affected Modules:** This pertains to the attention mechanism used during training and inference. Currently, Unsloth supports multiple attention backends: xFormers, PyTorch SDPA (scaled_dot_product_attention), FlashAttention, etc., each with pros/cons. The introduction of **FlexAttention** (a new PyTorch API in 2.1+) allows dynamic and flexible attention masking without needing separate custom kernels for each scenario ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=Although%20these%20fused%20attention%20implementations,slow%20runtime%20and%20CUDA%20OOMs)) ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=new%20PyTorch%20API)). The relevant code likely lives in model patching utilities – e.g., functions that replace the standard attention forward pass. In `unsloth.models._utils.py`, we see references to patching attention and references to SWA (Sliding Window Attention) and other masks. Issue #1561 lists tasks “Flex Attention for Gemma and others” and “Variable sequence length and auto unpadding/padding” ([[Fixing] More finetuning support · Issue #1561 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1561#:~:text=,attention)). Also, the Unsloth wiki explicitly mentions porting FlexAttention for all models ([Home · unslothai/unsloth Wiki - GitHub](https://github.com/unslothai/unsloth/wiki#:~:text=Port%20Flex%20Attention%20to%20Unsloth,for%20details%2C%20email%20me)). Therefore, modules like `patch_model_and_tokenizer` or a custom `LlamaAttention` are affected.
+
+**Proposed Code Modifications:**  
+- **Integrate PyTorch’s FlexAttention API:** PyTorch’s `torch.nn.attention.flex_attention` function can be used to implement various masking schemes in a single fused kernel ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=For%20some%20examples%20of%20attention,Capping)) ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=idiomatic%20PyTorch%20code,improvements%20over%20standard%20attention%20implementations)). We will incorporate this by modifying the model’s forward pass for attention layers. Specifically, for each transformer block’s attention, instead of using the model’s default implementation, we patch it to call `flex_attention(query, key, value, ...)`. The steps:
+  - Import the necessary API: `from torch.nn.attention import flex_attention, create_block_mask`.
+  - Determine the mask needed for the model/training scenario:
+    - For **causal LMs** (decoder-only models), we always need a causal mask (no attending to future tokens). FlexAttention can handle causal by providing a block mask or a score modifier. The PyTorch blog provides an example of creating a causal block mask ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=from%20torch)). We can do:
+      ```python
+      B, T, _ = query.shape  # batch, seq_len
+      # Use create_block_mask to generate a mask where query index >= key index (lower triangular)
+      block_mask = create_block_mask(causal=True, shape=(T, T))
+      output = flex_attention(query, key, value, block_mask=block_mask)
+      ```
+      However, since causal masking is so common, there might be a built-in optimization. Perhaps simply calling `flex_attention(query, key, value)` with appropriate sequence indices yields causal by default if Q_idx >= K_idx is enforced. The blog indeed shows usage with block_mask for causal.
+    - For **Sliding Window Attention (SWA)**: Many longer context models (e.g., Mistral, Gemma) use local attention windows to save memory. If a model like Gemma-2 is configured to only attend to the last N tokens for each query, we can create a block mask for that. For example, if window size = 1024, then mask out attention beyond 1024 distance. FlexAttention’s `create_block_mask` can combine conditions. We could do:
+      ```python
+      block_mask = create_block_mask(lambda b,h,q_idx,kv_idx: (q_idx >= kv_idx) & (q_idx - kv_idx < window))
+      ```
+      to enforce both causality and a window length. The PyTorch docs or attention gym examples likely have this snippet (the blog mentions sliding window + causal example with a mask) ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=Popularized%20by%20Mistral%2C%20sliding%20window,often%20used%20together%20with%20causal)).
+    - For **Packed sequences (multiple prompts in one batch)**: Unsloth might concatenate multiple shorter sequences into one long sequence with special tokens to mark boundaries (to utilize full sequence length and not waste padding). In such cases, we need a **document masking**: tokens from sequence A should not attend to sequence B. We can generate a mask matrix that prohibits cross-sequence attention. If we know the segment lengths or have an attention mask (1 for real tokens, 0 for pad or separator), we can compute a mask: for query at index i and key at j, mask if they belong to different segments. FlexAttention allows combining such custom masks easily. We can precompute a boolean matrix of shape (T, T) where cell (i,j) = False if i and j are in different segments (thus disallow attention), True otherwise. Then feed that as `block_mask`. Alternatively, we can supply a **score modification function**: e.g., give `score_mod` that sets scores to -inf for disallowed positions (the blog’s “Document Masking” example likely uses such a bias) ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=For%20some%20examples%20of%20attention,Capping)).
+    - For **Sorted by Length (SWA also sometimes refers to “sequences with different lengths in one batch”)**: If we pack sequences by sorting and concatenating, we need mask as above. FlexAttention can avoid recompiling when sequence lengths vary by using block masks instead of separate padding. We should ensure to use the **same compiled kernel** for varying sequence lengths. The blog shows that once compiled, calling flex_attention with different masks doesn’t trigger recompilation, as long as the function shape stays same ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=flex_attention%20%3D%20torch,return%20score%20%2B%20bias)). We might want to compile a specialized function upfront. For example:
+      ```python
+      compiled_flex_attn = torch.compile(flex_attention)  # compile for performance
+      self.flex_attn_fn = compiled_flex_attn  # store for reuse
+      ```
+      Then use `self.flex_attn_fn(query, key, value, block_mask=...)` inside each forward. This will JIT-compile one kernel that can handle the general case of our mask (maybe we compile with a representative mask).
+  - **Implement patching logic:** In `patch_model_and_tokenizer`, after loading the model, for each attention submodule (e.g., `model.model.layers[i].self_attn` in LLaMA or `model.transformer.h[i].attn` in Qwen), replace its forward method. One way: define a new forward closure that captures the required mask logic. For example:
+    ```python
+    def new_attn_forward(self, hidden_states, attention_mask=None, **kwargs):
+        # Compute Q, K, V as usual (linear projections):
+        q = self.q_proj(hidden_states)  # shape (B, T, n_heads*head_dim)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        # Reshape to (B, n_heads, T, head_dim)
+        q = q.view(B, self.num_heads, T, self.head_dim)
+        ... similarly k, v ...
+        # Permute to shape (B*n_heads, T, head_dim) if flex_attention expects (Bxh, T, d)
+        q = q.flatten(0,1); k = k.flatten(0,1); v = v.flatten(0,1)
+        # Create block_mask for causal or SWA or both:
+        mask = None
+        if self.window_size is not None:
+            # sliding window + causal
+            mask = create_block_mask(lambda b,h,i,j: (i>=j) & (i - j < self.window_size), shape=(T, T))
+        else:
+            # just causal
+            mask = create_block_mask(causal=True, shape=(T, T))
+        # If we have a doc attention mask from attention_mask (B, 1, 1, T) style, incorporate it:
+        if attention_mask is not None and attention_mask.ndim == 4:
+            # attention_mask is 0 for padded positions, maybe create block for those
+            # Convert to 1D mask per sequence and integrate into block_mask or as score_mod
+            # Possibly simpler: multiply into scores after flex_attn, but that loses flash benefits.
+            # Instead integrate by constructing bias_mod from attention_mask.
+            attn_bias = (attention_mask.squeeze() == 0)  # shape (B, T), True for pad positions
+            # Construct score_mod to set score=-inf when kv_idx is pad:
+            def bias_mod(score, b, h, q_idx, kv_idx):
+                # score: (Bxh, T, T) maybe, but b indexes combined B and h
+                # We need to map b to actual batch index: batch_idx = b // n_heads
+                batch_idx = b // self.num_heads
+                if attn_bias[batch_idx, kv_idx]:
+                    return float('-inf')
+                else:
+                    return score
+            output = flex_attention(q, k, v, block_mask=mask, score_mod=bias_mod)
+        else:
+            output = flex_attention(q, k, v, block_mask=mask)
+        # Reshape output back to (B, T, embed_dim) 
+        output = output.view(B, self.num_heads, T, self.head_dim).permute(0,2,1,3).reshape(B,T, self.embed_dim)
+        # Apply output projection
+        return self.o_proj(output)
+    ```
+    The above pseudo-code shows integrating causal + window mask via `block_mask`, and using a `score_mod` to incorporate the typical padding mask (turning scores for padded tokens to -inf). Another way to handle padding: use `block_mask` as well, by extending its logic to also mask out positions where `kv_idx` is beyond the sequence length of the sample. If sequences are concatenated in one batch, we can create a block_mask that encodes which positions are real for each sequence. This is more complex to do inside the attention call without breaking the fused nature. The `score_mod` approach might be simpler for padding/doc masks: it can check a precomputed array of valid lengths.
+    
+    We should take advantage of FlexAttention’s ability to **not recompile for different masks**. The blog suggests that if we vary the mask, it doesn’t trigger a new compile, whereas varying PyTorch code normally would ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=match%20at%20L477%20flex_attention%28,Compiles%20the%20kernel%20here)). This is achieved because the mask conditions are passed as data (tensors) rather than code. The `create_block_mask` likely returns a tensor that encodes allowed positions (maybe like a sparse mask representation). Changing its content doesn’t recompile the kernel – it’s just data.
+
+- **Auto unpadding:** The issue mentions **auto unpadding/padding**. FlexAttention inherently can skip computation for masked positions (sparsity). We should verify if it does “sparsity = True” for masked-out areas. The blog mentions “take advantage of sparsity in the attention mask, resulting in significant improvements” ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=idiomatic%20PyTorch%20code,improvements%20over%20standard%20attention%20implementations)). This implies if we feed a block_mask with a lot of False entries (like for padded tokens), FlexAttn will not compute those interactions. That’s effectively auto-unpadding – we don’t pay cost for padded parts. Therefore, by using block_mask for padding, we achieve auto unpadding without manual sequence trimming.
+  Additionally, the mention of “packed sequence masks” likely means if we combine sequences, the block_mask ensures no cross-talk, effectively treating them separate – which is a form of *efficiently packing*. FlexAttn handles that elegantly compared to standard implementations which might require looping or masking in Python.
+
+- **Special cases:** For certain models like **Gemma** (which presumably uses SWA), we’ll need to know the window size. Possibly store `model.config.swa_window = N` if available, or we might derive it (e.g., Gemma might be a variant of Mistral with context 8192 but effective window 2048 for attention). If not in config, we might set it manually based on model type. Unsloth could maintain a dictionary of known settings (e.g., `if "gemma" in model_name: window=2048`). Ideally, the model’s config or architecture should expose it. If not, we can allow the user to specify via an argument or environment variable for FlexAttn.
+
+**Dependencies:** PyTorch 2.1 or above is required for `torch.nn.attention.flex_attention`. We also rely on Torch’s ability to compile to a fused kernel. Ensure Unsloth’s installation pins a version of PyTorch that includes FlexAttention. If not, we might need to bump the requirement (e.g., to 2.1.0 or later). Also, ensure that xFormers or FlashAttn doesn’t conflict. If we’re introducing FlexAttn, we might disable or bypass xFormers usage (since FlexAttn supplants it in functionality). The FlexAttn code uses PyTorch’s internal utilities; no new external library is needed, but it’s important that the environment has the CUDA toolkit appropriate for torch.compile if using that. Also note: **Triton** is often used under the hood by flash-attn; FlexAttn uses torch.compile which may generate Triton or C++ code automatically. If Triton is not available on Windows, we have to see if torch.compile works on Windows for this (it might fallback on CPU only if no Triton; unclear). This ties into Windows support later – we might make FlexAttn a feature that’s available only on Linux for now.
+
+**Best Practices:**  
+- **Fallbacks for older torch:** Not all users may have PyTorch 2.1. We should implement FlexAttn support such that if `flex_attention` is not available, Unsloth gracefully falls back to the next best (xFormers/Flash). Perhaps structure the code as: 
+  ```python
+  try:
+      from torch.nn.attention import flex_attention, create_block_mask
+      USE_FLEX = True
+  except ImportError:
+      USE_FLEX = False
+  ```
+  Then in patching, if `USE_FLEX`, do as above; else keep current behavior. This maintains compatibility.
+- **Unified mask logic:** Write helper functions to generate masks. For example, a function `get_block_mask(seq_lengths, window, causal=True)` that returns a block mask tensor for a given batch, where `seq_lengths` is a list of lengths for each sequence in the batch (for packed sequences scenario). This can use `create_block_mask` with a custom lambda that checks if `q_idx` and `kv_idx` fall within the same sequence boundaries. Or simpler, create a block_mask for the entire max length, then set to False positions that violate segment boundaries. If necessary, one can construct a mask tensor manually: `mask = torch.zeros(T, T, dtype=torch.bool)` and then fill True for allowed positions, then pass that to flex_attention. (FlexAttn likely accepts a bool mask where True means compute attention, False means mask out).
+- **Supervise training performance:** After integrating FlexAttn, measure training speed and memory vs. previous backends. It should be comparable or better than flash/xformers. The blog claims performance on par with FlashAttention2 ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=We%20benchmark%20it%20against%20,mask%20as%20this%20mask%20has)). If any slowdown, profile which part (maybe our Python lambda for bias_mod? If that’s an issue, we might need to precompute a bias matrix instead of a Python function, because `score_mod` can also accept a tensor bias IIRC). Possibly use `bias=torch.where(pad_mask, -inf, 0)` and feed as `score_bias` if available.
+- **Test with compiled mode:** Unsloth often uses `torch.compile` for speed. FlexAttn is explicitly designed to work with `torch.compile` (in fact, requires it to fuse). So this aligns well. Ensure that when compiling the model, we don’t inadvertently compile FlexAttn each iteration. We should compile it once. The blog shows usage of `functools.partial` and `torch.compile` to freeze some bias and avoid recompilations ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=flex_attention%20%3D%20torch,return%20score%20%2B%20bias)) ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=flex_attention%28...%2C%20score_mod%3Dbias_mod1%29%20,kernel%20here)). In our case, masks can change per batch if sequence lengths differ. But they claim mask changes do *not* trigger recompile. Still, to be safe, we could compile a version with a generic mask shape and reuse it (as suggested earlier).
+- **SWA and long context:** If a model uses sliding windows to extend context, ensure our mask is correct for all layers. Possibly not all layers use the same window (some architectures use larger windows in later layers). If needed, handle per-layer window sizes (maybe stored in config as list). If unspecified, assume uniform window.
+- **Causal mask double-check:** FlexAttn’s causal example likely uses `block_mask=causal_mask` to ensure triangular shape. We should double-check if FlexAttn automatically handles causal when `attention.is_causal=True` in model config (some internal might exist, but safer to be explicit). Testing generation outputs against baseline can validate that we didn’t screw up masking (e.g., model shouldn’t start paying attention to future tokens).
+
+**Potential Challenges & Workarounds:**  
+- *Debugging mask functions:* Creating the correct `block_mask` lambda for complex conditions can be tricky. If we get it wrong, we might inadvertently allow forbidden attention or mask needed attention. We should write unit tests for the mask logic. For example, test on small sequences manually: construct a batch with two sequences concatenated, create block_mask with our function, then verify that for any token in seq1, tokens in seq2 are masked (and vice versa). We can do this by converting the block_mask to a dense boolean matrix and checking it.
+- *Performance corner cases:* If the block_mask is extremely sparse (say packing many short sequences in a long sequence), FlexAttn will skip a lot of compute, which is good. But if the mask changes drastically per batch, ensure it’s not recompiling. The blog suggests it won’t. If it does, one workaround is to restrict variety – e.g., group similar lengths per compiled function. But that’s probably unnecessary with FlexAttn’s approach.
+- *Interplay with dropout:* Standard attention sometimes uses dropout on attention weights during training. If FlexAttention doesn’t handle that internally, we should simulate it. Possibly by applying a `score_mod` that zeroes out random positions. However, PyTorch’s native flash attention drops out via scaling factor. FlexAttn might currently not support dropout (or does it? The blog didn’t explicitly say). If not, we might rely on upstream layers applying dropout on outputs or skip dropout for attention weights when using flex (the training difference is minor for large models, but it’s a change). If needed, could manually apply dropout to `output` after flex_attention. Or implement a `score_mod` that multiplies scores by a random mask (which is complicated and defeats determinism). Likely acceptable to skip explicit attention dropout because many recent implementations do (FlashAttn v2 effectively doesn’t need dropout because it’s already stabilized).
+- *Backward compatibility with xFormers/Flash:* We plan to unify them eventually (Issue #6). For now, implementing FlexAttn will overlap with that refactor. We might do them together: design a unified `AttentionBackend` class with modes. But focusing on FlexAttn, we must ensure any existing flags (like `--use_xformers`) are either overridden or produce a warning that FlexAttn is now default. Possibly allow an override: if user specifically requests xFormers, skip flex patch. But since FlexAttn can cover all use cases xFormers did (memory efficient attn), it could become the default. We should still test on older GPUs – FlexAttn uses torch.compile which requires a GPU with compiler support (NVIDIA GPU with CUDA, etc.). On very old GPUs (sm_50 series), it might not perform well. xFormers had broad support down to sm_50 with lower efficiency. But requiring a modern setup might be fine given Unsloth targets reasonably new hardware (especially for bigger models).
+- *Edge cases: SWA + packed + causal combinations:* FlexAttn is specifically built to handle combinations of masks ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=For%20some%20examples%20of%20attention,Capping)). We will exercise that: e.g., if we pack sequences and also apply sliding window, ensure the lambda or mask intersects both conditions (the lambda approach with `&` conditions as above should handle it). We might prefer using `create_block_mask` multiple times and combining results. For example:
+  ```python
+  causal_mask = create_block_mask(causal=True, shape=(T,T))
+  window_mask = create_block_mask(lambda b,h,i,j: (i - j < window), shape=(T,T))
+  combined_mask = causal_mask & window_mask & doc_mask_tensor
+  ```
+  if the library allows elementwise combine of BlockMask (if not, just multiply the boolean tensors).
+- *Memory overhead:* FlexAttention will allocate some structures for mask. If sequence length is large (say 8k), a full mask matrix is 64M elements which is not trivial. But it’s bool, could be 64MB at 8k seq. In training, that’s acceptable relative to model weights, but keep in mind if we set extremely long context (like 32k), the mask is 1B entries (bitmask can compress but PyTorch likely uses bool as byte -> 1GB). Perhaps FlexAttn’s `create_block_mask` is optimized (maybe creates a compact representation or a piecewise function rather than full matrix). The blog hints it might not materialize full matrix. We should research if FlexAttn has an abstraction for large masks (since they specifically mention improvements for “tiled” and “paged” attention as well). If memory becomes an issue, one workaround is to break the sequence or apply attention in chunks – but that’s what FlexAttn is supposed to avoid (by doing it in one kernel). We assume the PyTorch team handled it smartly. If not, and for extremely long contexts, we might consider not using block_mask for full context but only for local window (which is already sparse).
+- *Gemma specifics:* Gemma 2 might have a special pattern (e.g., segmented attention). The tasks mention it explicitly, so probably sliding window. After implementing FlexAttn, test on Gemma 2 (if we have access to a Gemma 2 model through HF) to ensure it works and speeds up training (the issue likely arises from Gemma’s large context causing slow attention, which FlexAttn can improve).
+
+By implementing FlexAttention, Unsloth will support **dynamic sequence lengths and advanced masking** without needing separate custom CUDA kernels for each scenario. This means features like **sliding window attention (local attention)** for long contexts, **packed sequences** (multiple samples in one sequence with masking), and standard **causal masking** can all coexist in one efficient attention kernel ([
+    
+      FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention | PyTorch
+    
+  ](https://pytorch.org/blog/flexattention/#:~:text=For%20some%20examples%20of%20attention,Capping)). This will reduce recompilation overhead and simplify the codebase (as we can drop special-case xFormers/FlashAttn logic eventually). It’s a significant architectural improvement for training efficiency on long or complex sequences.
+
+## 5. Support Sequence Classification – Fine-Tuning and Patching for `AutoModelForSequenceClassification`
+
+**Affected Modules:** Unsloth was primarily designed for causal language model fine-tuning (chatbots, generative models). To support sequence classification, we need to adjust how models are loaded and how training is executed. Specifically, the classes like `AutoModelForSequenceClassification` (which wrap an LM with a classification head) should be usable. This affects:
+- The model loading utility (`FastLanguageModel.from_pretrained` or a new `FastClassificationModel.from_pretrained`).
+- Patching functions that modify models (e.g., int8 loading, LoRA injection, gradient checkpointing) – they need to handle the classification head.
+- The training loop or trainer configuration: sequence classification uses a different loss (cross-entropy on class labels) and expects label tensors of shape (batch,) rather than shifted LM labels. We might use the Hugging Face `Trainer` or adjust TRL’s `SFTTrainer` to accommodate this. 
+Issue #1561 explicitly lists “Support sequence classification” as a task ([[Fixing] More finetuning support · Issue #1561 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1561#:~:text=,attention)), and a contributor noted they implemented it with LoRA successfully ([[Fixing] More finetuning support · Issue #1561 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1561#:~:text=Zzhiter%20%20%20commented%20,69)). So the demand is to allow tasks like sentiment analysis, intent classification, etc., using Unsloth’s efficiency.
+
+**Proposed Code Modifications:**  
+- **New class or extension for classification models:** Introduce a `FastClassificationModel` in Unsloth analogous to `FastLanguageModel`. This class would provide:
+  - `from_pretrained`: which internally calls `AutoModelForSequenceClassification.from_pretrained` to get the model (with `num_labels` classes) and also loads the tokenizer.
+  - It then applies the usual Unsloth patching: e.g., if `load_in_4bit=True`, convert the base model weights to 4-bit (bitsandbytes) – ensuring to skip the final classification layer (which is small, we can leave it in fp16 or fp32 as is). If LoRA is requested, prepare the model for LoRA (apply LoRA to the base transformer layers; typically we wouldn’t LoRA the classification head itself as it’s just a linear layer you can fine-tune directly).
+  - `for_training` method: if needed, to put the model in train mode and maybe adjust any layer norms (Unsloth sometimes patches LayerNorm for stability).
+  - Ensure the returned model’s dtype and device management is consistent with Unsloth (e.g., move to GPU, cast).
+  
+- **Patching utilities adjustments:** In `patch_model_and_tokenizer` (in `_utils.py`), where it currently probably handles models of type `AutoModelForCausalLM`, add logic for `AutoModelForSequenceClassification`. This can be done by checking `isinstance(model, transformers.PreTrainedModel)` and looking at `model.config`:
+  - If `model.config.problem_type` or `model.config.num_labels` is set (sequence classification models often have `num_labels >= 2` and an attribute `model.classifier` or `model.score` for the head), then treat it as classification.
+  - The base of a classification model is often accessible via `model.base_model` or `model.transformer` or `model.roberta` etc., depending on architecture. For GPT-like models (e.g., if someone does `AutoModelForSequenceClassification.from_pretrained("gpt2")`), Hugging Face likely inserts a small linear head on top of the final hidden state (taking e.g. the last token or an average). For BERT-like (encoder) models, it takes [CLS] token hidden state.
+  - Unsloth’s focus is on LLMs, so we consider primarily classification on decoder-only models (like using LLaMA or Mistral for classification by appending a small head). But supporting encoder models (RoBERTa, BERT) would be nice too. Since Unsloth’s optimizations (4-bit, gradient checkpointing, etc.) are general, we can allow any `AutoModelForSequenceClassification`.
+  - In patching, apply the same memory optimizations to the base transformer: e.g., enable gradient checkpointing on the transformer layers (skip the classifier layer). If using 4-bit quantization via bitsandbytes, use `BitsAndBytesConfig` to quantize the transformer weights but not the classifier layer (Hugging Face’s `AutoModelForSequenceClassification.from_pretrained` with `load_in_4bit=True` *should* handle this automatically – it will quantize the large weights and keep final Dense in FP32).
+  - LoRA: If user wants to LoRA fine-tune, we integrate with PEFT. Peft can wrap a classification model as well. One approach: use `peft.get_peft_model(model, LoraConfig(...))`. This will insert LoRA layers into the base model’s attention and feed-forward, and leave the classifier head trainable too (by default, LoRA doesn’t target the classification head unless specified, which is fine). The contributor in the issue said they “implemented sequence classification and supported LoRA with no loss in experiments” ([[Fixing] More finetuning support · Issue #1561 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1561#:~:text=Zzhiter%20%20%20commented%20,69)), meaning this approach works. We might incorporate their code if available (maybe they will contribute a PR).
+  - Verify that after patching, `model.forward(input_ids, labels=...)` returns a loss for classification. Hugging Face’s classification models typically compute `logits = model.classifier(final_hidden)` and if `labels` provided, compute `loss = cross_entropy(logits, labels)`. We should ensure this still works after quantization or LoRA. (Quantization: bitsandbytes 4-bit might not by default quantize the classification head, since it’s not a Linear of a certain size? If it does, ensure `model.classifier.weight` doesn’t become a fake-quant that breaks loss calculation. Likely it stays fp32).
+  
+- **Adapt Trainer or training loop:** Unsloth mostly relies on TRL’s `SFTTrainer` for causal LM fine-tuning. That trainer assumes a causal language modeling objective (it expects `labels` of shape (batch, seq_len) and computes cross-entropy ignoring padded tokens). For sequence classification, we need a different training objective:
+  - If using Hugging Face’s `Trainer`, we can plug in our model and let Trainer compute loss via `model(**batch)`. The batch from a dataset would have `input_ids`, `attention_mask`, and `labels` (size B). The model’s forward will output `loss` (since HF classification models implement it).
+  - We can still use many of Unsloth’s tricks with the HF Trainer: e.g., gradient accumulation, bf16 training, etc., by setting TrainingArguments. We lose TRL’s specific logging maybe, but that’s fine. Perhaps simplest: if user is doing sequence classification, instruct them to use `transformers.Trainer` (since sequence classification is a straightforward supervised task).
+  - However, to integrate with Unsloth’s style (which often shows one unified approach), we might enhance `SFTTrainer` or provide a similar `SeqTrainer`. TRL’s SFTTrainer is a thin wrapper around HF Trainer configured for causallm, so adapting it may be as easy as switching the loss function. Possibly we can subclass SFTTrainer or monkey-patch its compute_loss. For example, detect if `model.config.num_labels` > 0 (classification model) and override `SFTTrainer.compute_loss` to do:
+    ```python
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        # outputs for a classification model: (loss, logits, hidden_states, attentions) if labels in, or logits if labels out
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+        return (loss, outputs) if return_outputs else loss
+    ```
+    This might already be handled if SFTTrainer doesn’t do anything fancy. Actually, TRL’s SFTTrainer might simply rely on model’s loss if present. We should confirm: If we pass a classification model (which returns `loss` when labels provided) into SFTTrainer, it might just work, as SFTTrainer inherits from HF Trainer and defers to `model(**batch)` for loss. If no special logic prevents it, maybe only minimal changes needed. We should test this: e.g., use SFTTrainer with a small BERT for classification. If it errors due to shape mismatches (like it might be adding an `ignore_token_id` mask or something expecting sequence labels), then we adjust.
+  - Also, turn off any data collator that was adding causal LM labels. For classification, the collator should just pad inputs and stack labels. HF’s default `DataCollatorWithPadding` works. We might simply use that instead of `DataCollatorForSeq2Seq` or `UnslothDataCollator` which were for LM. So in our training pipeline, detect classification and choose an appropriate collator.
+  
+- **Evaluation metrics:** For classification tasks, users will want accuracy, F1, etc. While not strictly an “implementation” detail, we should ensure that after fine-tuning they can evaluate. Possibly integrate with HF’s Trainer evaluation or instruct how to use `trainer.predict` (which should output logits that can be argmaxed). The Issue #1514 conversation about `train_on_responses_only` (not directly classification, skip that). But classification tasks often require evaluating on a validation set – Unsloth could leverage HF’s Trainer capability for that.
+
+**Dependencies:** No new dependencies – we utilize `transformers` and `datasets` as usual. Possibly integrate with **PEFT (peft library)** for LoRA on classification models (Unsloth already depends on it for LoRA on LMs). Ensure compatibility: peft’s LoraConfig should target appropriate modules (e.g., in a BERT, target query,key matrices in each layer; in a LLaMA classification model, target the same q,k,v in base). This likely works out-of-the-box given the base model architecture is known to peft. Bitsandbytes is used for quantization – just verify bitsandbytes supports int8/4bit on classification models. It should, because it’s just replacing Linear layers. The classifier head linear might be too small to quantize effectively, but leaving it in fp32 is fine.
+
+**Best Practices:**  
+- **Allow gradient training of classifier head:** Typically, for classification, you definitely want to train the final classification layer (which is randomly initialized if you load a base LLM without a pre-existing head). So ensure `model.classifier.parameters()` (or whatever the head is) have `requires_grad=True`. If we freeze the base with LoRA, those LoRA and classifier params are the only trainable ones – which is correct. If not using LoRA, by default all weights (including full base) would train, which might be okay for smaller models but not for very large ones due to compute. It might be beneficial to allow an option to freeze the base and just train the classifier (classic transfer learning). We can implement a simple utility: if user sets `--train_classifier_only`, then do:
+  ```python
+  for param in model.base_model.parameters():
+      param.requires_grad = False
+  ```
+  and perhaps use a different optimizer for only classifier params (though HF Trainer can handle that if we just freeze and pass all params; it will skip frozen ones).
+  However, Unsloth’s selling point is efficient finetuning of large models – full fine-tuning a 7B LLM for classification might be overkill when just adding a head could do. But maybe tasks require some base tuning. We should at least document how to freeze if needed.
+- **Learning rate considerations:** The classification head often needs a higher LR initially (because it starts from scratch) compared to the base (which might need a smaller LR to not forget). Some approaches do differential LR. In our plan, we might not implement that automatically, but we can advise the user to use `--learning_rate` appropriate or fine-tune in two stages (head-only then unfreeze).
+- **Logging and output:** Modify training scripts to handle metrics like accuracy. Possibly integrate with `datasets.load_metric` for common metrics if easy.
+- **Support multi-class and binary alike:** `AutoModelForSequenceClassification` covers both. If `num_labels=1` (regression), the model outputs a scalar and uses MSELoss. We should support that too (someone might fine-tune an LLM for a regression task). HF handles it internally via `config.problem_type`. So just don’t break it. As long as we feed `labels` as floats for regression, model will do MSE.
+- **Memory and speed:** A sequence classification fine-tune often uses shorter sequences (e.g., sentence or paragraph length) and so is lighter than full LM fine-tuning. We can likely handle bigger batch sizes. Unsloth’s gradient checkpointing on the base can help memory if we fine-tune base. But if base is frozen (except LoRA), we might disable checkpointing to save time (no need to checkpoint frozen layers). Could implement: if a param group’s requires_grad all False, skip checkpointing that part. Not critical though.
+- **Compatibility with `train_on_responses_only`:** Not applicable for classification, but just ensure none of that logic runs (it triggers only for chat templates and causal models).
+- **Testing:** Try a known classification dataset (e.g., SST-2 for sentiment). Fine-tune a LLaMA-2-7B (or 3B) for sentiment with a small head via Unsloth pipeline. Verify that after training, `model.predict` gives correct label outputs. Compare training time vs vanilla HF (Unsloth should allow using 4bit to fit in smaller GPU, etc.). If possible, replicate the contributor’s experiment: they claimed no loss in accuracy using LoRA via Unsloth ([[Fixing] More finetuning support · Issue #1561 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1561#:~:text=Zzhiter%20%20%20commented%20,69)), so ensure our approach matches theirs (probably they did base LoRA + classifier training which is standard).
+
+**Potential Challenges & Workarounds:**  
+- *Hugging Face model quirks:* Some models might not readily have a `AutoModelForSequenceClassification` class implemented (though Transformers covers most). For example, for LLaMA, there is `LlamaForSequenceClassification` implemented as of HF transformers 4.33 (it was added in a recent update) ([LLAMA for sequence classification · Issue #24731 - GitHub](https://github.com/huggingface/transformers/issues/24731#:~:text=LLAMA%20for%20sequence%20classification%20%C2%B7,Tokeniser%20and%20models)). If a user tries to use a model that doesn’t have a classification variant by default, `AutoModelForSequenceClassification` will internally create one on the fly (it can wrap any base model by adding a classification head). We should test that for a LLaMA model. Issue #24731 on HF GitHub was precisely about using LLaMA for sequence classification with LoRA ([LLAMA for sequence classification · Issue #24731 - GitHub](https://github.com/huggingface/transformers/issues/24731#:~:text=LLAMA%20for%20sequence%20classification%20%C2%B7,Tokeniser%20and%20models)) – which is essentially what we are tackling. HF likely resolved it by now in code. If not, our code might need to manually create a classification head. But since they mention LLaMA support, we assume HF has it (the `transformers.models.llama` module likely has a `LlamaForSequenceClassification` class now).
+- *Mixed precision and head:* If we do mixed precision (bf16), ensure the classification head’s output is float32 when computing loss to avoid any numeric issues. HF usually takes care of autocast around loss. Just keep an eye if any NaNs appear when training at high LR – might need gradient clipping or lower LR.
+- *Integration with existing API:* How will user invoke this? Possibly via a flag in the CLI like `--task sequence_classification`. We should adapt the CLI (unsloth-cli or notebooks) to demonstrate classification usage. For example, allow `model_name="bert-base-uncased", task="sequence_classification"` which triggers using `FastClassificationModel`. Or detect if a dataset is specified for classification (like if labels are integers and an `eval_split` is given).
+- *Evaluation and Inference after training:* Provide a snippet to use the fine-tuned model for inference (e.g., `pipeline = TextClassificationPipeline(model=model, tokenizer=tokenizer, device=…)`). Ensure that our model (with possible LoRA merged or bitsandbytes) can be used in such a pipeline. If bitsandbytes 4-bit is used, one might need to cast to fp16 for CPU usage or use model on GPU for inference. Possibly, after training, the user can call `model.merge_and_unload()` to merge LoRA weights and then `model.to_float16()` to get a standard model for export. We should test that workflow.
+- *Corner case - multiple choice:* While sequence classification usually means one input -> label, there’s also multiple-choice tasks (like question with several options). HF often models those by formatting the input and using a classification head with num_labels = number of choices, or using a different head. We probably don’t need to explicitly handle multiple-choice differently – a multiple-choice task can be turned into a sequence classification per choice (with separate forward passes) easily. So it’s not a priority. But just note if someone wants to fine-tune on multiple-choice, they can do so by slightly adapting the dataset and using our classification support.
+
+By implementing these changes, Unsloth will enable fine-tuning LLMs for classification tasks with the same efficiency benefits as its generative fine-tuning. Users could train, for example, a 7B model to classify documents, using 4-bit quantization and LoRA to do it on a single GPU – which is a strong value proposition. This broadens Unsloth’s applicability beyond chatbots to tasks like sentiment analysis, topic classification, etc.
+
+## 6. Refactor Attention – Unified Interface for xFormers, SDPA, Flash-Attn, Flex-Attn
+
+**Affected Modules:** The attention mechanism code in Unsloth is currently fragmented to support different backends. For instance, enabling xFormers memory-efficient attention requires setting `model.enable_xformers_memory_efficient_attention()`, FlashAttention v1 might require importing a separate kernel, FlashAttention v2 (PyTorch 2.0’s SDPA) uses `scaled_dot_product_attention`, and soon FlexAttention (PyTorch 2.1+) as discussed. Unsloth likely has conditional logic scattered in model patching or forward functions to pick one. Issue #1561 highlights the need to **“Refactor and merge `xformers`, `SDPA`, `flash-attn`, and `flex-attention`”** into a unified simpler interface ([[Fixing] More finetuning support · Issue #1561 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1561#:~:text=,attention)). This suggests centralizing the selection of attention implementation.
+
+**Proposed Code Modifications:**  
+- **Abstract attention selection into a single module:** Create an `AttentionBackend` class or a simple function in Unsloth that encapsulates all variants. For example, define something like:
+  ```python
+  def efficient_attention(query, key, value, mask=None, backend="auto"):
+      # query, key, value are tensors (B, n_heads, T, head_dim) or flattened (B*n_heads, T, d)
+      if backend == "torch" or (backend=="auto" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
+          # Use PyTorch SDPA (FlashAttention v2)
+          return torch.nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=mask, dropout_p=0.0, is_causal=causal_flag)
+      elif backend == "xformers":
+          return xformers.ops.memory_efficient_attention(query, key, value, attn_bias=mask_bias if mask else None)
+      elif backend == "flash1":
+          # call flash-attn v1 if installed
+          return flash_attn_fn(query, key, value, dropout_p=0.0, causal=causal_flag)
+      elif backend == "flex":
+          return flex_attention(query, key, value, block_mask=mask_block)
+      else:
+          # default to naive (for CPU or unsupported env)
+          scores = torch.matmul(query, key.transpose(-2,-1)) / math.sqrt(d)
+          if mask_tensor is not None:
+              scores = scores + mask_tensor    # mask_tensor should be -inf for pads
+          attn = torch.softmax(scores, dim=-1)
+          output = torch.matmul(attn, value)
+          return output
+  ```
+  The above pseudo-code shows handling various options. The key is to interpret a unified `mask` input properly for each. For xFormers, we might need to provide the mask as bias (since xformers API often expects a bias tensor where masked positions have large negative values). For SDPA (FlashAttn2), we can supply `attn_mask` as a boolean or additive mask.
+  
+  This unified function can reside in a new file (e.g., `unsloth.attention_utils.py`). It should accept parameters indicating whether causal masking is needed or if a full attn_mask is provided (like for padding).
+  
+- **Interface for user/developer:** Provide a setting in Unsloth config or environment to choose the backend. For example, `UNSLOTH_ATTN_BACKEND=flex` or `--attention_backend flex`. Default can be "auto", which picks the best available: e.g., if PyTorch’s SDPA is available (torch>=2.0 and not overridden), use that; if not, and xFormers is installed, use that; etc. The logic could prioritize:
+  1. Flex (if torch>=2.1 and not disabled, because Flex covers all including causal and any mask).
+  2. Else if torch>=2.0 (which includes SDPA) and GPU is available, use SDPA (which under the hood uses FlashAttention v2 for NVIDIA GPUs in many cases).
+  3. Else if xFormers is installed and allowed, use xFormers.
+  4. Else if flash-attn (the separate package by HazyResearch) is installed, use it (for torch 1.x or specific needs).
+  5. Else fallback to standard.
+  
+  We must allow override because sometimes SDPA might be available but xFormers could be faster for certain GPUs or sequences, or vice versa. Also, for debugging, one might force a specific backend.
+  
+- **Patching model code:** Instead of having separate monkey patches for each attention type, have one patch that calls our unified function. For instance, replace the attention computation in all transformer layers with:
+  ```python
+  # inside LlamaAttention.forward or similar
+  # ... after projecting q, k, v ...
+  attn_output = efficient_attention(q, k, v, mask=attn_mask, backend=self.attn_backend)
+  ```
+  Here `self.attn_backend` could be set when initializing the model or patching (e.g., set to whatever the global config is).
+  
+  For Hugging Face models that already support some of these via config (e.g., `model.config.use_flash_attention_2` or `model.config.use_xformers` flags exist in some versions), we can ignore those and use our unified approach for consistency. Possibly, if `backend="xformers"`, we could even just call `model.enable_xformers_memory_efficient_attention()` which internally does similar replacement – but doing it ourselves allows combining with masks logic easily.
+  
+- **Consolidate environment checks:** Remove or simplify code paths like:
+  ```python
+  if use_xformers: ... 
+  elif use_flash: ...
+  ```
+  Instead, set up `model.attn_backend = chosen_backend` and ensure only one code path (our efficient_attention) is used. This simplifies maintenance because improvements (like integrating Flex) only need to be updated in one place.
+  
+- **Remove Triton custom kernels if any:** If Unsloth had any Triton-based fused attention kernels (some projects do custom kernels for specific models), consider removing or deprecating them in favor of the above approach. The maintenance overhead of custom kernels is high, and with FlexAttn and FlashAttn2 readily available, it’s better to rely on those. The user story indicates desire for simplicity without losing performance, so using well-supported libraries fits that.
+  
+- **Logging and verification:** Perhaps have the model print which attention backend is being used for clarity (especially if auto-chosen). E.g., when training starts, log “Using FlexAttention for attention computations” or similar.
+
+**Dependencies/Libraries:** We need to ensure all four options are importable carefully:
+- **xFormers:** optional dependency. In `pyproject.toml`, it might be included for certain extras (like with specific torch versions). Our unified code should handle if `import xformers` fails – just skip that option.
+- **FlashAttention (HazyResearch)**: optional. Many may not have it installed unless explicitly done. It’s fine – if not present, skip that path. If present, import e.g. `from flash_attn.flash_attn_interface import flash_attn_func` (depending on version).
+- **PyTorch SDPA:** available in torch>=2.0 as `F.scaled_dot_product_attention`.
+- **FlexAttention:** available in torch>=2.1 as `torch.nn.attention.flex_attention`.
+- **Triton**: Not directly needed by us if we use above, as those either use Triton internally (flash and SDPA do).
+  
+We should test each backend in isolation to ensure our integration is correct:
+  - With xFormers: does our call produce identical results to baseline attention? (within tolerance). Write a small test comparing to naive attention for a random tensor.
+  - With SDPA: ensure `is_causal` and `attn_mask` usage is correct (for causal, we can pass `attn_mask=None, is_causal=True` which applies tri mask, plus perhaps an `attention_mask` for padding).
+  - With Flex: as implemented in issue #4 plan.
+  - With flash-attn v1: ensure correct shapes. FlashAttn v1 expects queries of shape (Batch*heads, seq, dim) and certain alignment in memory (multiple of 128 for seq maybe, but not mandatory).
+  
+**Best Practices:**  
+- **Default to stable high-performance option:** Likely PyTorch’s native SDPA (FlashAttn2) is a safe default for most cases (it’s maintained by PyTorch, works on Windows for basic operation albeit slower since no Triton, on Linux uses fused kernels). FlexAttn is newer; we might default to it only if user explicitly opts in for now until it’s battle-tested. Possibly the “auto” logic: if PyTorch 2.1 is present, maybe prefer Flex since it can handle SWA etc. But if user isn’t using SWA or packing, FlashAttn2 is fine. Either is fast; FlexAttn overhead might be slightly higher for pure causal only (but should be similar).
+- **Ensure determinism if needed:** Some combos (xFormers) aren’t deterministic. Provide a note that if `torch.use_deterministic_algorithms(True)` is set, it might force fallback to naive attention. If determinism is needed, user might avoid these fast paths. This is fine as long as training still works (just slower).
+- **Memory usage:** Monitor memory with each backend. xFormers is memory efficient by design (less memory usage than standard). FlashAttn2 is both fast and memory-saving (by not storing large attn matrix). FlexAttn likewise. But we should ensure no memory leak or extra copy. The unified interface can help manage that – for instance, if using xFormers, we must ensure `query, key, value` are contiguous as needed (xFormers sometimes requires it). Possibly call `.contiguous()` on them before passing to unify any layout differences from different model implementations. Similarly for SDPA, ensure data types match (FlashAttn2 works in BF16/FP16 on GPU – if inputs are fp32 it might fall back slower).
+- **Compatibility across models:** This unified function should work for both decoder-only and encoder-decoder. For an encoder (like BERT), causal_flag = False and we typically have a padding mask. For a decoder in encoder-decoder (like T5 decoder), we have causal mask *and* maybe cross-attention (cross-attn not covered by these fused routines directly because cross-attn has no causal constraint but uses different key/value from encoder). For cross-attn, we can still use scaled_dot_product_attention (just no causal and mask might just be padding). So we should also integrate cross attention: in the T5 cross-attn forward, we can call our efficient_attention with appropriate mask. That means our code should be flexible if `key` and `value` come from encoder (possibly shorter length than query). Most fused kernels allow that as long as dimensions align (just produce an output of length T_query). We need to be careful to not apply causal mask in cross-attn.
+- **Edge of sequence lengths:** If sequence length is small, overhead of flash/flex might outweigh benefits. But that’s a minor concern; these kernels handle small seq fine nowadays.
+
+**Potential Challenges & Workarounds:**  
+- *Differing API expectations:* xFormers and FlashAttn have slightly different mask representations. Our unified function will need to prepare masks differently. For example, if we have a PyTorch `attention_mask` (B,1,1,T) with 0 for pads, we can convert it to the form each backend needs:
+  - SDPA wants either a float mask of shape (B, heads, Q_len, K_len) with -inf for masked, or a boolean mask (recently it supports bool, where True=keep, False=mask? Actually, it expects float mask with -inf for masked).
+  - xFormers can take a `attention_mask` via their `MemoryEfficientAttentionFlashAttentionOp` if you pass an `attn_bias` object. They have classes like `LowerTriangularMask()` for causal and `AttentionMask` for padding. We might use xFormers’ API: `xformers.ops.LowerTriangularMask()` to get a bias for causal, and for padding combine with `attention_mask`. Alternatively, xFormers allows passing a precomputed bias tensor (B*heads, Q_len, K_len) with -inf at masked spots.
+  - Perhaps simpler: convert any provided `attention_mask` to a bias matrix `mask_bias` (B, 1, 1, K_len) where mask_bias[..., j] = 0 or -inf depending if token j is pad. Then:
+    - For SDPA: pass that via `attn_mask=mask_bias` (it will add to scores).
+    - For xFormers: flatten B*heads and expand the bias accordingly.
+    - For Flex: incorporate into block_mask or use score_mod as earlier.
+    - For naive: just add to scores.
+  - Causal is separate: we can handle causal internally rather than requiring a mask input for it, since it’s a known pattern (like an argument `causal=True`). This is easier than generating a big mask matrix for causal each time. All backends have a native way: SDPA has `is_causal` flag, FlashAttn v1 has `causal=True` param, xFormers we can give a LowerTriangularMask, Flex we handle via block_mask.
+  
+- *Testing across hardware:* xFormers and FlashAttn v1 are mainly for NVIDIA. SDPA is NVIDIA optimized. On CPU or other GPUs, these will fall back to normal attention (SDPA does have a CPU implementation but not any faster than matmul-softmax). So on CPU or MPS (Apple), none of these give benefit. Our unified interface should detect if GPU is not available or not suited, and just use the standard method (or at most the PyTorch efficient CPU kernel if exists). This ensures we don't try to use xFormers on CPU (which is not implemented and will error).
+  
+- *Windows compatibility:* 
+  - xFormers now has some Windows wheels for specific torch versions, but if not installed, fine. PyTorch SDPA works on Windows but uses a slower path since Triton is Linux only – it will still function though. FlashAttn v1 doesn’t officially support Windows easily (you’d have to compile, which most won’t). FlexAttn should technically work on Windows if torch.compile works (though without Triton, probably slower). We should confirm that if user on Windows chooses e.g. `backend="torch"` (SDPA), it won’t crash – it should run, just not faster than baseline. If any of these calls cause issues on Windows (like some might require a compiled component not available), we may need to catch and fall back. 
+  - Possibly default to naive attention on Windows to avoid Triton issues, unless bitsandbytes? Actually, bitsandbytes and triton we address in Windows support separately. 
+  - We might exclude backend choices that aren’t supported on Windows in our auto logic. (E.g., if `sys.platform == "win32"`, skip xFormers/flash, use SDPA or naive.)
+  
+- *FlashAttn v1 vs v2 confusion:* If using PyTorch 2.0+, `F.scaled_dot_product_attention` with dropout=0 and causal achieves essentially the same as flash-attn v2. Installing flash-attn library might not be necessary. Possibly the user base might not have flash-attn lib installed at all, preferring the built-in. So our code path for flash1 might rarely be hit. But including it for completeness/hypothetical performance (some claim flash-attn v1 could be slightly faster in some edge cases or older GPUs).
+  
+- *Maintaining backward compatibility in API:* If previously Unsloth had environment flags `USE_XFORMERS`, etc., we can map those to the new setting. For example, if `os.environ['USE_XFORMERS'] == '1'`, we set `backend='xformers'`. Similarly for `USE_FLASH_ATTENTION`. And if new `UNSLOTH_USE_FLEX` is set, override to flex. This ensures existing scripts still respect user intention.
+  
+- *Stepwise migration:* We might first implement the unified interface and route existing options through it. Then gradually remove older code. For safety, keep the old flags as aliases to the new mechanism (maybe print a deprecation warning). This refactor should not change output or performance (aside from minor overhead differences) – it’s about cleaning up and making it easier to extend (like adding Flex).
+  
+- *Ensuring seamless Unsloth functionality:* After refactor, run all Unsloth tutorial notebooks or tests to ensure nothing broke. Because attention is central, any bug could have big impact (e.g., divergent training if mask wrong). So thorough testing on known tasks (like fine-tune a model on a small dataset and compare training loss curve with and without this refactor) would be prudent.
+
+With this unified attention interface, developers can add new attention mechanisms (like future PyTorch releases or other custom kernels) easily in one place, and users can trust that Unsloth will automatically pick the best option for their hardware and model. It simplifies troubleshooting and ensures consistency across different model types and training configurations.
+
+## 7. Tool Calling – Integration and Demonstration in Colab
+
+**Affected Modules:** “Tool calling” refers to allowing the model to invoke external tools/APIs (e.g., calculator, search engine) during generation. While this is more of an **application-level** feature than a training one, integrating it means adjusting data handling and inference pipeline. Unsloth’s core might not have direct support yet, but we can add utilities for it. Specifically:
+- **Data format:** If fine-tuning a model to use tools, the training data needs to include tool usage steps. We need to standardize how these are represented in the conversation format.
+- **Chat template processing:** The `apply_chat_template` function and message content handling must support tool-related message types (in addition to 'text' and 'image').
+- **Inference pipeline:** For demonstration, likely we won’t build a full agent loop inside Unsloth itself, but rather show how to use a fine-tuned model in a Colab notebook where the model’s outputs are intercepted and if a tool tag is present, the corresponding function is executed, then fed back into the model.
+
+**Proposed Code Modifications and Plan:**  
+- **Extend conversation schema for tools:** Define a new content type, e.g., `"type": "tool"` for when the assistant calls a tool, and perhaps `"type": "tool_result"` for the tool’s reply (if we want to feed it back in structured form). For example, a conversation could be represented as:
+  ```json
+  {"role": "assistant", "content": [
+      {"type": "text", "text": "Let me check that for you."},
+      {"type": "tool", "tool_name": "calculator", "tool_input": "2+2"}
+  ]}
+  {"role": "system", "content": [
+      {"type": "tool_result", "tool_name": "calculator", "tool_output": "4"}
+  ]}
+  {"role": "assistant", "content": [
+      {"type": "text", "text": "The answer is 4."}
+  ]}
+  ```
+  We need to decide how to linearize this into the training text. One approach is to insert special tokens or markup. For instance, the model’s prompt could include a special sequence like `<tool:calculator>2+2</tool>` and then later `<tool_result:calculator>4</tool_result>`. The fine-tuning data should have these in the transcript so the model learns to output them.
+  Unsloth’s chat template might be extended to handle these custom types. Perhaps in `apply_chat_template`, add:
+  ```python
+  if segment['type'] == 'tool':
+      return f"[TOOL:{segment['tool_name']}] {segment['tool_input']} [/TOOL]"
+  if segment['type'] == 'tool_result':
+      return f"[TOOL_RESULT:{segment['tool_name']}] {segment['tool_output']} [/TOOL_RESULT]"
+  ```
+  and for 'text', keep as is.
+  This yields a combined conversation string with special markers. We would also need to add these special tokens to the tokenizer’s vocabulary (so they aren’t split weirdly). Possibly define new tokens like `<|tool:calculator|>` etc., but that could explode for many tool names. Simpler: a generic token like `<|tool|>` and the tool name as plain text after it. Alternatively use bracket notation as above which will just be tokenized into normal tokens (but the model can learn the pattern).
+  
+  For an initial implementation, using a consistent textual pattern (like `[TOOL:name] input [/TOOL]`) is fine, since it doesn’t require tokenizer changes if name and words are in vocab. This is also readable.
+  
+- **Prepare fine-tuning data:** Provide guidance or a script to convert a raw log of tool interactions (if user has them) into this format. Possibly not code changes in library, but documentation or helper. Since the user specifically asks for a Colab notebook demonstration, we can implement the conversion in that notebook rather than library. The question notes that *embedding images or plotting charts features are disabled* – not directly relevant, but suggests focusing on textual demonstration.
+  
+- **Colab notebook demonstration:** We will create a notebook (as part of Unsloth examples) showing:
+  1. Fine-tuning a model with tool use examples. If no dataset is readily available, we might simulate a small one (like a couple of crafted Q&A pairs where the assistant calls a calculator or searches).
+  2. After training (or using a pre-fine-tuned checkpoint, to save time), demonstrate inference with tool use. This means implementing a simple agent loop:
+     - The user asks a question.
+     - The model generates a response. We monitor the generated text for the special `[TOOL:...]` tag.
+     - If found, we parse out the `tool_name` and `tool_input`.
+     - We then call the corresponding function. In Colab, we can have a dictionary of dummy tools: e.g., `'calculator': lambda x: str(eval(x))` for arithmetic, `'wiki_search': function that returns some fake snippet or a fixed output`.
+     - We then inject the tool’s result back to the model. To do this, we append a new turn to the conversation: a system or assistant turn containing the `[TOOL_RESULT:...] output [/TOOL_RESULT]`. (Could use a special role "tool" – but easiest is to treat tool result as coming from the system or environment).
+     - Then we prompt the model again to continue the assistant’s answer, now including the result in the context.
+     - The model hopefully then continues and completes the answer.
+     
+     This loop continues if the model calls multiple tools. We show one iteration in the demo (most likely one tool usage per query in simple scenarios).
+     
+  3. The notebook will show the final answer and verify it’s correct (the tool got used meaningfully).
+  
+- **Integration into Unsloth library:** We may not need heavy library changes beyond data formatting. The fine-tuning process uses the same SFTTrainer but now on data that includes these special tokens. Possibly define those tokens in the tokenizer. For example, to avoid the bracket tokens being split, we might want to add `[TOOL`, `TOOL]` etc. to the tokenizer’s special tokens or at least as additional vocabulary. Alternatively, use existing tokens like `<` `|` `>` etc., which the model can understand as markup. If using LLaMA-based models, they have `<s>` and such tokens, but not sure they have square brackets. It might be okay. If the model occasionally generates slightly off format, that’s part of training quality.
+  
+  If we wanted to be rigorous, we could extend the tokenizer by adding special tokens like `<|tool|>` and `<|result|>` to denote transitions, but that requires resizing embeddings and is more complicated. Given the scope, treat it as textual.
+  
+- **No effect on core training code:** The training will just see a longer input-output sequence (with tool tags). The model will learn to output e.g. `[TOOL:Calculator] 2+2 [/TOOL]` when needed. This requires the dataset to have correct targets. If we have few examples, the model might not reliably learn it. For demonstration, even a naive finetune on a handful of examples might suffice to illustrate the behavior (since user likely just wants to see it working).
+  
+- **Using OpenAI function calling format (optional):** Another approach is to fine-tune the model to use an OpenAI-like function calling JSON format, but that requires more complex generation logic. Given Unsloth’s typical user, the simpler bracket style might be fine. Alternatively, we could format as: Assistant says: “<calc>2+2</calc>” and we interpret `<calc>` as a call. This is essentially the same idea with different token.
+  
+**Dependencies:** No new external libs; for demonstration we may use Python’s eval for calculator, and maybe `wikipedia` API or `requests` for a search tool demonstration (if internet enabled – in Colab we could access Wikipedia). But such dependencies would be within the notebook, not Unsloth itself. The user explicitly said if previously mentions of embedding images or plotting, ignore them – which implies the answer should focus on textual output. So we can keep tool usage textual (no need for visualizations).
+
+**Best Practices:**  
+- **Tool JSON vs text:** It’s important the model reliably outputs a pattern we can detect. Using distinctive delimiters like [TOOL:...] is good. We should avoid something that might also appear in normal text. The chosen format is fairly unique. Document this format in the notebook so users know how to prepare data. Possibly contribute an entry in Unsloth wiki for “Tool-usage fine-tuning”.
+- **Limit the scope:** Emphasize that enabling tool use requires appropriate fine-tuning; it’s not an out-of-the-box ability. The Colab will fill that gap by showing how to fine-tune on a small number of examples. If more robust capability is needed, one would need a larger dataset of tool interactions (which may be scarce).
+- **Integration with conversation templates:** If Unsloth’s `ChatTemplate` class or similar enforces certain formatting (like always wrapping assistant messages in certain tokens), ensure that our tool tags don’t conflict. Possibly treat them as part of the assistant message. We might need to bypass some filtering – e.g., if there's any sanitization that removes unknown tags.
+- **Keep the demonstration simple and reproducible:** The user likely expects a clear, step-by-step demonstration in the explanation (though here we provide plan, not actual Colab code). We should outline that in the final write-up, making it understandable how to implement:
+  1. Prepare dataset with tool tags.
+  2. Fine-tune with Unsloth.
+  3. During inference, intercept tool tags and produce results, feed back to model.
+  
+- **Parallel to function calling in OpenAI / LangChain:** We can mention that this is analogous to OpenAI’s function calling mechanism, but here it’s all learned behavior. Optionally, note that one could fine-tune a model to output a JSON with function and args (like OpenAI function calling format) and then parse JSON – but doing so would be very similar conceptually. Our approach is fine.
+
+**Potential Challenges & Workarounds:**  
+- *Model compliance:* The model might not perfectly follow the expected syntax, especially if training data is limited. It might omit a closing tag or produce a slightly different string (like "Using Calculator:2+2"). Our demo should handle slight variants or at least highlight them. We can make our parsing a bit flexible (e.g., detect the word "Calculator" and the expression after it). But for simplicity, assume it follows format if fine-tuned properly.
+- *Overfitting in demonstration:* If we train on only one or two examples, the model might overfit (only call the calculator for exactly "2+2" because it saw that). To mitigate, we can include a couple of different math problems and maybe a different tool (like a weather or wiki lookup) to generalize pattern. Not too many needed for demo, but at least variety of tool names/inputs.
+- *Involving system role:* Possibly the tool result injection might be better as a **system** message so the model doesn't try to mimic it. Alternatively, treat it as if the tool itself responded. In our schema above, we put it as `role: system` with content type 'tool_result'. Another approach: treat the tool as a pseudo-user or assistant. E.g., use role "assistant" but with a special content that means tool output. However, that could confuse the model’s role understanding. System role might be cleaner (system messages in many templates are used for instructions or additional info).
+  We should decide and be consistent. If we use system for tool results, adjust chat template application to include system messages inserted mid-conversation (some templates may only put system at start). Alternatively, define a new role "tool" and adjust the conversation format to include it properly (the model should treat it as external info). For simplicity, using system as a generic container for tool outputs is okay.
+- *No training for agent loop:* We are not training the model to decide *when* to call a tool – in our small fine-tune, we will explicitly have the user request something requiring a tool, and show the assistant doing it. The model might learn to always call the tool when faced with similar query. That’s fine. But it might not learn to stop and wait for result properly if not carefully shown. In the data, ensure the sequence is: assistant outputs tool call *and then stops*. This likely means splitting into turns as we did. To get the model to stop generation after outputting `[TOOL:..][/TOOL]`, one trick is to insert an end-of-turn token or have the tool call format end with the assistant’s turn. We might need to use the special end-of-sequence token to prompt a stop, or rely on generation parameters (stop sequence = `[/TOOL]`).
+  During inference, we can set the stopping criteria to break when `[/TOOL]` is output, then execute the tool, then continue.
+- *Multi-step reasoning with tools:* That can get complex (like using tool multiple times or combining results). Out of scope for now. We focus on one call then answer.
+- *Parallel tool execution during training vs. inference difference:* In training data, we show the whole interaction including the result. But in inference, the model won't actually have the result until we feed it. So we must simulate that by splitting generation. This disparity (model was trained on complete dialogues but at inference we have to cut it off) is typical in such pipeline. It should be okay, but realize the model during training saw the entire conversation including the tool output, so at inference if we didn’t feed it back it would hallucinate it. That’s why we must feed back. The model hopefully then continues seamlessly. We should test that the model, when fed the tool result, uses it appropriately (in training it did, so likely).
+- *Safety and other considerations:* Not directly relevant for the scope, since we are presumably using this for benign tasks. But tool use can raise security concerns (if the model could execute arbitrary code). In our controlled Colab, we only allow specific safe functions.
+
+Overall, implementing tool calling in Unsloth involves mostly **data and demonstration** rather than deep library changes. The key code changes are allowing special content types in conversation formatting. With that and a well-crafted example, we can showcase the capability. (We will **provide a structured step-by-step plan** in the output to match the user’s request for clarity.)
+
+## 8. VLMs Train Only on Completions – Fixing `train_on_responses_only` for Vision-Language Models
+
+**Affected Modules:** The utility function `train_on_responses_only` (likely defined in `unsloth.chat_templates` or similar) is used to configure the trainer to only compute loss on the assistant’s responses (and not on the prompt/user input). This is often done to avoid training the model to parrot the prompt. It works by masking label tokens corresponding to the prompt with -100 so they don’t contribute to loss. Currently, it likely works for text-only chats (as indicated by release notes ([Releases · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/releases#:~:text=Train%20on%20Completions%20%2F%20Inputs))), but for vision-language sequences it might not function correctly. The issue likely arises because the presence of image tokens or different sequence formatting confuses the logic that identifies where the user prompt ends and the assistant response begins. We saw in Issue #1505 a user had trouble with `train_on_responses_only` causing an error in a Phi-4 context ([NONE OF VISION MODELS ARE WORKING FOR FINE-TUNES · Issue #1505 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1505#:~:text=Loading)) – though not specifically VLM, it shows the function can cause issues if not used correctly. For VLMs, the added complexity is the image data.
+
+**Proposed Code Modifications:**  
+- **Enhance `train_on_responses_only` to recognize image tokens:** The typical implementation of `train_on_responses_only(trainer, instruction_tag, response_tag)` likely works by scanning the input IDs for the sequence that marks the start of assistant response and then setting all previous tokens’ labels to -100. For example, if the prompt uses a token like `<|assistant|>` or the conversation format known, it uses those indices. In vision models, how are images represented? Often, an image in the text input is represented by a special token (or a sequence of tokens). Qwen-VL’s tokenizer, for instance, uses `<Image>` tokens as placeholders ([Supporting training/inference of vision LLM using multiple images · Issue #1369 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1369#:~:text=But%20I%20get%20the%20following,error)). LLaVA-type models might use a similar marker or just treat images via separate input (like the collator handled).
+  
+  We should modify `train_on_responses_only` to handle two scenarios:
+  1. If images are represented as special tokens in `input_ids`: treat them as part of the user prompt. So they should also be masked (we don’t want the model to predict the `<Image>` token, presumably).
+  2. If images are not in `input_ids` (some implementations might feed images outside of text), then `train_on_responses_only` can operate as usual on text tokens.
+  
+  For Qwen and LLaMA-2 Vision, images *are* integrated as tokens (as evidenced by mismatch error and how Qwen’s processor works). So likely case 1.
+  
+  Concretely, if `train_on_responses_only` currently finds the first occurrence of the assistant role token or uses the known prompt length, we ensure that image tokens (which come during the user prompt) are not mistaken for part of assistant response. Perhaps the simplest is:
+    - Use the conversation messages to determine indices: If we have access to the original `messages` list in each example (the data collator had it), we could compute how many tokens belong to user vs assistant. But `train_on_responses_only` as written likely operates on the Trainer’s dataset after tokenization, where that info might be lost.
+    - Alternatively, rely on special separators. For instance, in the processed text, maybe the sequence looks like: `"[INST] ... [/INST] <image> ... <image> ... [/INST] ... answer tokens ..."`
+      If so, one can search for a pattern or an offset.
+    - In the July release notes, they show usage: `trainer = train_on_responses_only(trainer, instruction_part="<|im_start|>user\n", response_part="<|im_start|>assistant\n")` ([train_on_responses_only · Issue #1514 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1514#:~:text=I%20saw%20the%20following%20code,tuning%20tutorial)) for Qwen 2.5. This suggests their approach: they look for the substring `<|im_start|>assistant\n` in the concatenated text and mask everything before it. That works if the tokenization keeps those markers intact (which for Qwen it likely does, as those are part of Qwen’s format). For LLaMA-based ones, maybe they use `<s>` or simply position.
+    - We should adapt this: ensure that any image placeholders that occur before `<|im_start|>assistant` are also masked (which they would be, since they’re before the assistant tag).
+    - The bug may be if the assistant tag or its tokenization changed for multimodal models. Perhaps the function didn’t locate it properly if images inserted newlines or something. We can robustify by searching for a sequence of token IDs corresponding to the assistant start. Or possibly simpler: when collating, store an attention mask or label mask that marks which indices are user vs assistant, and then just assign that to trainer.
+  
+  A straightforward solution:
+    *In the collator for VLMs*, after assembling the batch, we can compute `labels_mask` of shape (batch, seq_len) where 1 means token should be learned (assistant) and 0 means ignore (user+image). We can compute this if we know the boundary index for each sample. For example, Qwen’s processor might provide `input_ids` and also an `attention_mask` but not specifically which are assistant. We can possibly deduce by how we constructed the text:
+       - If we use something like `messages = [system, user(with images), assistant]` and `apply_chat_template` concatenated them, we could know the index where assistant content begins. Possibly we can modify `apply_chat_template` to return not just the text but also an index or a mask.
+       - A hack: maybe the label tensor we create can be directly adjusted. In Issue #1590 snippet ([Training a Vision Model with Text-only Inputs · Issue #1590 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1590#:~:text=,padding%3DTrue)), the user manually did `labels = input_ids.clone(); labels[labels==pad_token_id] = -100`. That masks padding but not prompt specifically. In Unsloth’s notebooks for continued pretraining, they might set labels to -100 for prompt by slicing.
+       - We can implement: find the token id for `<|im_start|>assistant`. For Qwen’s tokenizer, that is a special token. Or search for the sequence in the input_ids array (some risk if it appears elsewhere). If found at position j, set `labels[0:j] = -100`.
+       - For LLaMA-based, maybe the conversation format uses special tokens like “\</s\><s\>Assistant:” or simply the word "Assistant:" as a delimiter. We can have the user specify `response_part` string (as they do in train_on_responses_only call) and tokenize that and search.
+    - This approach can be applied generically if we have the markers. Since Unsloth’s chat templates define these, we can reuse them. Possibly `train_on_responses_only` already requires user to pass these substrings, as seen in usage ([train_on_responses_only · Issue #1514 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1514#:~:text=I%20saw%20the%20following%20code,tuning%20tutorial)). So our job is to ensure it works when images present. It likely will, because images are part of user content and come before the assistant marker, so they’ll be masked along with the rest of the prompt by the range selection. 
+    - However, maybe the bug is that `trainer.predict` was broken after using train_on_responses_only, as in #1514 ([train_on_responses_only · Issue #1514 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1514#:~:text=My%20question%20is%2C%20when%20I,Image%201%3A%20image)), returning empty predictions. The maintainer responded instructing to set `UNSLOTH_RETURN_LOGITS=1` to get logits back ([train_on_responses_only · Issue #1514 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1514#:~:text=danielhanchen%20%20%20commented%20,67)), implying some internal logic might remove logits when labels are -100 everywhere. In classification, if all tokens are -100 (like if one had a batch of only prompt, no answer?), then maybe the predictions end up empty. For VLMs specifically, maybe the way images were handled caused an edge case (like if the assistant has no text output in some dataset entry, then train_on_responses_only might mask the entire sequence).
+    - Ensuring `train_on_responses_only` is only applied where appropriate (like skip if the dataset only has user prompts and no assistant yet, as in some pretraining tasks).
+  
+- **Testing fix on a VLM scenario:** For example, fine-tune Qwen-VL on a simple Q&A where user provides an image and a question, assistant gives answer. Use `train_on_responses_only`. Ensure loss only on answer tokens. We check that the gradient flows for answer tokens, none for prompt. Possibly print the first batch’s labels to confirm all prompt tokens (including `<Image>` tokens) are -100. That validates the logic.
+  
+- **Integration with Issue #1 collator changes:** If we implement response-only masking in collator, we integrate it nicely. Alternatively, if `train_on_responses_only` is an independent function that wraps the Trainer’s `__call__` or dataset, we might prefer to keep it separate. But integrating in collator might be simpler for VLMs specifically. Perhaps do:
+  ```python
+  if self.train_on_responses_only:
+      # compute labels as above
+      batch['labels'] = labels_tensor  # already with -100 where needed
+  ```
+  Then one wouldn’t call the external function at all. But since `train_on_responses_only` is already part of Unsloth’s public API, we should keep it and just fix it internally to handle multimodal.
+  
+- **Dependencies:** No new ones. Just careful string or token handling. Possibly need to get special token IDs: e.g., `assistant_token_ids = tokenizer.encode(response_part, add_special_tokens=False)`. Then search for that subsequence in `input_ids`. Use a robust search (could do a convolution or simply a loop comparing slices, since sequence length isn’t huge after tokenization).
+  
+**Best Practices:**  
+- **Double-check indices off-by-one:** Ensure that when we mask up to but *not including* the assistant start token. Typically, you want to mask the assistant tag token itself as well? Actually, maybe not – often they leave the assistant role tag in the input but not to predict it either (the model doesn't need to predict the role tag, it's given). So yes, mask it too. Essentially, the first token the model should be scored on is the first word of the assistant’s reply content.
+- **Consistent with how loss is computed:** In HF’s causal LM modeling, if `labels[i] = -100`, that token’s prediction is ignored. So we mask the prompt tokens in labels, leaving only assistant tokens as normal. That’s correct.
+- **Edge-case: assistant with no content:** If a conversation has just prompt and no assistant (maybe in some dataset), then train_on_responses_only would mask everything, possibly leading to an empty label sequence (which could cause the `trainer.predict` issue where logits are empty). We might ensure to handle that gracefully (if all labels are -100 in a batch, maybe skip that batch or something). But usually training data will have at least one assistant token.
+  
+- **Document usage for multimodal:** Possibly update documentation: “Note: `train_on_responses_only` now supports multimodal prompts. Ensure that you pass the correct `instruction_part` and `response_part` strings matching the dataset’s format (including any special tokens). For example, for Qwen-VL, use the ChatML tags as shown in our example.” Actually, in #1514 they did just that, so likely just verify in README or wiki that they mention how to use it with vision models.
+  
+- **Keep function user-friendly:** Maybe detect the model type: if `trainer.model.config.model_type` indicates a known format (like 'qwen'), we could default the strings. But since they already provided example usage with explicit tags, it might rely on user providing them. Fine to leave that way.
+
+**Potential Challenges & Workarounds:**  
+- *Model tokenizer differences:* Each model might have different tokens for role separation:
+  - Qwen uses `<|im_start|>user` and `<|im_start|>assistant`.
+  - LLaMA-Adapter might use “### Human:” / “### Assistant:” in its fine-tuning data (if using Alpaca style format).
+  - If we want to generalize, it’s tricky. Perhaps that’s why they let the user pass the strings. So the user should know the format their data uses.
+  - We should ensure images in prompt don’t break the pattern. Likely they don’t, aside from adding content between user start and assistant start.
+  
+- *Case where assistant also can produce an image (not typical in current models, but possible in future). If it did, train_on_responses_only should still only train on assistant outputs (including any images it outputs, if that were a thing). But currently, most VLM fine-tunes have user image + text prompt, assistant text answer. So we assume that.
+  
+- *The error Sebaxakerhtc reported in #1505 about “Unable to create tensor, you should probably activate truncation” ([NONE OF VISION MODELS ARE WORKING FOR FINE-TUNES · Issue #1505 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1505#:~:text=Loading)) might have been due to train_on_responses_only messing up sequence lengths (maybe leaving labels longer than input_ids or something). We should double-check our implementation doesn’t alter shapes incorrectly. It shouldn’t: we keep labels same length, just mask values. Possibly his error was unrelated (or he used it in a scenario not compatible).
+  
+- *Performance:* train_on_responses_only itself doesn’t add heavy overhead; it just masks some labels, which is fine. The new logic (searching for tag in each sample) adds a tiny overhead but negligible compared to training.
+  
+- *Interaction with data collator padding:* If we do the masking on a concatenated string after tokenization, we must ensure to handle padding. E.g., after tokenization, sequences might be padded to same length. The assistant tag might occur at different index per sample. In an ideal scenario, we handle each sample individually. Possibly the current function operates on the dataset *before* collation, padding each sequence’s labels appropriately with -100 where needed, then DataCollator just pads as usual (padding -100 remains -100). If not, it might be applied after collation (less likely, because then different sequences in a batch could interfere).
+  
+It may be simpler to implement `train_on_responses_only` as a dataset transform: iterate dataset examples, for each do tokenization (or use already tokenized), identify prompt vs response, set label mask in the `labels` field for that example. Then feed to Trainer with `label_pad_token_id=-100` so that padding is also -100.
+This ensures each example already has the correct labels mask irrespective of padding.
+
+Given Unsloth’s style, they probably did something like:
+```python
+def train_on_responses_only(trainer, instruction_part, response_part):
+    trainer.data_collator.mask_prompt = True
+    trainer.data_collator.instruction_part = instruction_part
+    trainer.data_collator.response_part = response_part
+    return trainer
+```
+or actually might wrap the collator. Another approach is wrapping the model’s `generate` or dataset. But likely collator.
+
+We can either implement in collator or in a preprocessing of dataset. If modifying collator, easier to integrate with our collator code that already deals with VLM images (since collator sees the constructed conversation). Perhaps do:
+```python
+if self.train_on_responses_only:
+    for i in range(len(labels)):
+        start_idx = find_assistant_start(input_ids[i])
+        if start_idx is not None:
+            labels[i, :start_idx] = -100
+```
+ That requires a method `find_assistant_start`. We can implement by searching for the token sequence of `assistant_token_ids` within `input_ids[i]`. Or maybe store `assistant_token_id = tokenizer.convert_tokens_to_ids('<|im_start|>assistant')` if single token. However, might be multiple tokens (like `<|im_start|>` might be broken into `<|` + `im` + `_start` etc if not single).
+Better to search for the sequence of IDs for the provided `response_part` string as we have it.
+
+Given an environment example from #1514:
+```python
+trainer = train_on_responses_only(trainer, instruction_part="<|im_start|>user\n", response_part="<|im_start|>assistant\n")
+```
+We can capture those strings in the collator via `self.instruction_part` and `self.response_part`.
+Actually, `train_on_responses_only` could attach these to the trainer or collator (maybe as lambdas or partial function to apply on each batch).
+But since we’re refactoring, we can implement inside collator if collator knows those strings.
+
+Alternatively, simply fix `train_on_responses_only` function:
+  - It likely gets the trainer, pulls out `trainer.train_dataset`, and does a transform on it. The fastest way is to use the `dataset.map` function: 
+    ```python
+    def mask_labels(example):
+        input_ids = example['input_ids']; labels = example['labels']
+        text = tokenizer.decode(example['input_ids'])  # reconstruct, but that’s expensive and lossy maybe due to merges
+        # better: find sub-sequence of token ids for response_part
+        resp_ids = tokenizer.encode(response_part, add_special_tokens=False)
+        # find resp_ids in input_ids
+        idx = find_sublist(input_ids, resp_ids)
+        if idx is not None:
+            for j in range(idx):
+                labels[j] = -100
+        return {"labels": labels}
+    train_dataset = train_dataset.map(mask_labels)
+    trainer.train_dataset = train_dataset
+    if trainer.eval_dataset:
+        trainer.eval_dataset = trainer.eval_dataset.map(mask_labels)
+    ```
+    This way, the dataset’s labels field is modified once and for all.
+  
+  That approach is straightforward. Need to ensure that `labels` field exists (it would if we pre-tokenize with labels = input_ids clone normally).
+  If using HF’s `Trainer` with `DataCollatorForLanguageModeling`, the collator can create labels on the fly. But Unsloth’s pipeline likely either uses a custom collator or static labels. In our collator code earlier, we manually created labels from input_ids. We can incorporate mask logic right after that creation.
+
+- *Testing after fix:* Try `trainer.predict` as user did, verify it returns logits (the issue had an environment var fix, maybe after our fix that isn’t needed).
+  
+By carefully addressing how the assistant start is detected and ensuring image tokens are treated as part of the prompt, we will make `train_on_responses_only` robust for VLM fine-tuning. This allows users to fine-tune models on image+text -> text data without the model learning to reproduce the image tokens or user question, focusing loss only on the answer. 
+
+## 9. Windows Support – Making `pip install unsloth` Work on Windows (Triton, xFormers, bitsandbytes)
+
+**Affected Modules:** This is about packaging and dependency management. The main obstacles for Windows installation are:
+- **Triton**: NVIDIA Triton library (used by PyTorch for fused kernels or by some custom ops) does not have official Windows support. If Unsloth’s `pyproject.toml` lists `triton` as a requirement, pip on Windows will fail to find a wheel (as seen in the dependency resolution error ([Pip installation failing due to unsloth-zoo? · Issue #1150 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1150#:~:text=%C3%97%20No%20solution%20found%20when,zoo%3D%3D2024.10.2))).
+- **xFormers**: until recently, xFormers had limited Windows wheels. The conflict in issue #1150 ([Pip installation failing due to unsloth-zoo? · Issue #1150 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1150#:~:text=%C3%97%20No%20solution%20found%20when,zoo%3D%3D2024.10.2)) shows pip couldn’t resolve because `unsloth-zoo` required `torch>=2.4.0` and pinned xformers which required torch==2.3.1, etc. On Windows, often xFormers might not be available for the latest torch, causing issues.
+- **bitsandbytes**: historically not supported on Windows (would error out or require a separate fork like bitsandbytes-windows). However, the latest bitsandbytes 0.41 introduced limited CPU-only Windows support (not GPU). Still, installing it via pip on Windows is problematic because it tries to compile CUDA kernels (which fails).
+- Possibly **others**: e.g., Unsloth might list `ninja` or specific versions of torch, which might not be available on Windows, but main are above.
+  
+The goal is to allow `pip install unsloth` to complete on Windows without error. The user presumably will use CPU or maybe an NVIDIA GPU with CUDA on Windows (which is possible for torch and maybe xFormers if compiled). We should at least allow installation, even if some features are limited (like bitsandbytes falls back to CPU ops, Triton-based acceleration not used, etc).
+
+**Proposed Code Modifications:**  
+- **Conditional dependencies in `pyproject.toml` or `setup.cfg`:** Use environment markers to exclude certain packages on Windows. For example:
+  ```toml
+  [project.optional-dependencies]
+  full = [
+      "triton>=2.0.0; sys_platform != 'win32'",
+      "bitsandbytes>=0.39.0; sys_platform != 'win32'",
+      "xformers==0.0.27; platform_system != 'Windows'",
+      ...
+  ]
+  ```
+  This way, on Windows pip will ignore those. Alternatively, set them as optional extras only installed on Linux. If Unsloth currently directly depends on unsloth-zoo which in turn depends on these, we might need to adjust unsloth-zoo’s packaging similarly.
+  
+  The error log ([Pip installation failing due to unsloth-zoo? · Issue #1150 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1150#:~:text=%C3%97%20No%20solution%20found%20when,zoo%3D%3D2024.10.2)) suggests unsloth has different extras like `[cu118-ampere-torch230]`. Possibly they created environment-specific extras to get the right torch and xformers version combos. This approach is complex and pip’s resolver had trouble. Perhaps simplifying dependencies:
+  - For Windows, do not enforce a specific torch version or xFormers version. Let user install torch separately (commonly, Windows users install torch via wheel from pytorch site).
+  - Possibly require only `transformers`, `datasets`, etc., which all work on Windows. Mark heavy ones as optional.
+
+- **bitsandbytes:** On Windows, the user can’t use the GPU 4-bit quantization (bitsandbytes doesn’t support). We should ensure Unsloth can run without bitsandbytes:
+  - Already Unsloth might catch if bitsandbytes not available and skip 4-bit usage. We should test that scenario. If not, implement a safe fallback: e.g., if user tries `load_in_4bit=True` on Windows, raise a friendly error or warning that bitsandbytes is unavailable on this platform.
+  - In packaging, exclude bitsandbytes on Windows to allow pip success. If bitsandbytes is truly needed (for 4bit) on Windows, one workaround is to instruct to use the [bitsandbytes-windows fork on conda](some users have a workaround). But it’s unstable. Better to just disable it.
+  
+- **xFormers:** It’s not critical for functionality if not present. It mainly speeds up attention. If it can’t install, Unsloth should still function (just using torch default attention or flash if available). We can:
+  - Remove strict xformers requirement on Windows. Perhaps make it an extra: e.g., `unsloth[performance]` for Linux that includes xformers. Or at least `; platform_system == "Linux"` for that dep.
+  - Alternatively, if we want some support: xFormers now publishes wheels for Windows for torch 2.0/2.1 with CUDA 11.7+. If we want, we could allow `xformers>=0.0.20` on Windows optional. But simpler is to drop it from required list on Windows.
+  
+- **Triton:** If Unsloth’s code uses Triton (maybe custom kernels?), on Windows we have to disable that path. Possibly Unsloth used Triton for some quantization or attention optimization. We can guard those imports with try/except or `if platform != 'win32'`. For packaging, definitely exclude `triton` requirement on Windows. If some functionality absolutely needed Triton, we might not be able to support it on Windows – but likely it was optional optimization (PyTorch’s internal use of Triton is automatic and not our concern; but if Unsloth used openai/triton directly for custom ops, we disable those ops on Windows).
+  
+- **Ensure compatibility in code paths:** Possibly skip using bitsandbytes on Windows:
+  - For example, in `_utils.py`, they import bitsandbytes as bnb ([unsloth/unsloth/models/_utils.py at main · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/blob/main/unsloth/models/_utils.py#:~:text=match%20at%20L2732%20import%20bitsandbytes,as%20bnb)). We can change to:
+    ```python
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        bnb = None
+    ```
+    and then guard any usage of bnb. Similarly for xformers import. This way, if they aren’t installed, it won’t crash.
+  - Already in dependency resolution, we avoid installing them, so likely they won’t be present. Code must handle that gracefully.
+  
+- **Testing pip install unsloth on Windows:** After adjustments, on a Windows machine (or CI with windows), run `pip install git+https://github.com/unslothai/unsloth.git`. It should install without error. It will bring transformers, etc. Then test basic functionality:
+  - Import unsloth, load a model in CPU or using torch (which the user must install separately or via pip if we list `torch` as dependency).
+  - If unsloth doesn’t list torch as dependency (maybe relying on user to have a correct version), we might list it as conditional too. Some packages avoid pinning torch because user might want different CUDA versions. For Windows, it's probably best not to enforce a torch version, as user likely installed it manually. In #1150, they had extra for cu118, etc. Possibly skip that complexity on Windows by not having torch in requires (or have `torch>=2.0; platform_system != "Windows"` meaning on Linux we enforce minimal torch, on Windows none).
+  
+- **PyTorch version issues:** The conflict log suggests unsloth-zoo expected torch>=2.4 (which is a nightly at time of writing), to get new features. On Windows, torch nightly might be harder to get. For broader compatibility, maybe relax that requirement on Windows to torch>=2.0 or none. Perhaps one can’t use some new features (like maybe FlexAttn if torch<2.1). But that’s okay; Windows users can still use older features. The key is not blocking installation. Possibly print a warning if on Windows and not using recommended torch.
+  
+- **bitsandbytes alternative:** If someone really wants 4-bit on Windows, they might try to use the new bitsandbytes (which on Windows uses CPU ops, very slow). Another alternative is to use Intel’s 8-bit on Windows (which HF supports via CPU). But these are advanced. We can note that 4-bit GPU quant is unavailable on Windows.
+  
+**Best Practices:**  
+- **Platform detection in setup**: Use `sys.platform` or `platform_system`. PyPI uses PEP508 environment markers as shown above.
+- **Optional extras**: Provide a `[win]` extra that maybe installs things that do work on Windows, if any (maybe none extra needed).
+- **Documentation**: Update README to mention limited Windows support: “Unsloth can install on Windows now. Note: 4-bit quantization (bitsandbytes) and some CUDA optimizations are disabled on Windows. We recommend using Linux for optimal performance, but basic fine-tuning on CPU or on CUDA with PyTorch’s default kernels is supported on Windows.” Provide any known workarounds if user tries advanced features on Windows.
+- **Test on Windows with both pip and conda**: Many Windows ML users use Anaconda. Possibly put unsloth on conda-forge or at least ensure `pip install` into a conda env works. If our changes allow pip success, conda environment should be fine as long as proper torch is installed. (We might instruct: `pip install unsloth` after installing torch).
+  
+- **Continuous Integration**: If not already, add a GitHub Actions job for windows-latest, which tries to install unsloth and run a quick command (like import and maybe load a small model). This will catch any packaging issues going forward.
+
+**Potential Challenges & Workarounds:**  
+- *bitsandbytes pip behavior on Windows:* Currently, `pip install bitsandbytes` on Windows might actually succeed because bitsandbytes 0.41 provides a wheel (but it’s CPU-only and prints a big warning that it’s using an alternative implementation). If our dependency is not version-locked, pip might try to install it. If we exclude it via marker, then it won’t try. That’s safer, because the CPU fallback is extremely slow and not useful for fine-tuning large models. Better to not confuse users by installing it at all.
+- *xFormers on Windows with nightly torch:* If we required torch>=2.4 (nightly), on Windows there's likely no easily installable xFormers for that yet, causing that conflict. If unsloth is chasing nightly features, that’s tricky. Possibly solve by not forcing nightly on Windows – let user choose stable torch. The new features (like FlexAttn) won’t be available, but that’s acceptable for now. Document that some features require newer PyTorch which may not be fully supported on Windows.
+- *Functional differences without Triton:* Some Unsloth features might rely on custom Triton kernels (like maybe their 1.58-bit quantization for DeepSeek model?). If those are disabled, that specific feature won't function on Windows (since no Triton to run those kernels). We should either:
+  - Provide a CPU alternative (maybe very slow), or
+  - Clearly warn that certain pro features (like dynamic 1.58-bit quant) are Linux-only. The question specifically mentions "including compatibility fixes for Triton, Xformers, and bitsandbytes in pyproject.toml" – implying the main fix is packaging, not necessarily making Triton code work on Windows. Likely we just disable it gracefully.
+  
+- *Testing a training on Windows:* If possible, test a small fine-tuning (like on CPU or a small GPU) to ensure nothing crashes. Potential areas:
+  - PEFT LoRA on Windows (should work, it’s pure PyTorch).
+  - Grad cache or accelerate - ensure accelerate doesn’t attempt multi-gpu launch in a Windows incompatible way (it uses `spawn` which is fine if properly done).
+  - If using `torch.compile`, note that PyTorch 2.0’s compile on Windows might have limitations (especially with CUDA graphs).
+  - If something like `dynamo` or `compile` doesn't support Windows well, maybe default it off. Possibly Unsloth’s default use of `torch.compile` (if any) should be turned off on Windows because it might not yield benefits or have issues with triton. They might require an env var or pass if platform to not use it by default. For example, if `use_gradient_checkpointing="unsloth"` triggers a custom compiled forward, on Windows without Triton that might break or slow. Could skip or use standard checkpointing.
+  
+- *Lightning or other sub-deps:* If any part of Unsloth used PyTorch Lightning or others that have issues on Windows (not sure if unsloth uses Lightning, likely not since they use HF Trainer or TRL).
+  
+- *Unsatisfied optional dependency messages:* After we make those dependencies optional, some functionality will print warnings. For instance, if bitsandbytes is not installed and user tries 4-bit, we should produce a clear message "bitsandbytes not installed or not supported on this platform; cannot load 4-bit quantization." Similar for xFormers: "xFormers not installed, using default attention." This avoids confusion where the user might not realize they didn't get something. Possibly implement these warnings in the code where those features would be invoked.
+  
+By making these packaging changes, a Windows user can `pip install unsloth` and get the library installed. They will be able to fine-tune using standard PyTorch (likely slower or more memory, but functional). This addresses a broader audience and aligns with the issue asking for Windows support.
+
+---
+
+Each of the above plans addresses the specified unresolved issue with relevant code areas, modifications, dependencies, integration notes, and possible pitfalls. By following these implementation guides, developers can enhance Unsloth to be more feature-complete (multi-modal mixing, flexible attention, classification tasks, etc.) and user-friendly across different platforms (including Windows), while maintaining performance and clarity ([[Fixing] More finetuning support · Issue #1561 · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/issues/1561#:~:text=,attention)) ([Releases · unslothai/unsloth · GitHub](https://github.com/unslothai/unsloth/releases#:~:text=Llama,cmake)). The improvements will require careful testing, especially for complex features like FlexAttention integration and cross-platform compatibility, but will significantly extend Unsloth’s capabilities and reliability.
+

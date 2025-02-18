@@ -214,6 +214,14 @@ from .save import *
 from .chat_templates import *
 from .tokenizer_utils import *
 from .trainer import *
+from .models.vision_data_utils import UnslothVisionDataCollator, ImageResizeTransform
 
 # Patch TRL trainers for backwards compatibility
 _patch_trl_trainer()
+
+__all__ = [
+    "UnslothTrainer",
+    "UnslothTrainingArguments",
+    "UnslothVisionDataCollator",
+    "ImageResizeTransform",
+]

@@ -3,6 +3,8 @@ import torchvision.transforms as T
 from torch.nn.utils.rnn import pad_sequence
 from PIL import Image
 from transformers import AutoProcessor
+from typing import List, Optional, Union, Dict, Any
+import warnings
 
 class ImageResizeTransform:
     """
@@ -22,101 +24,208 @@ class ImageResizeTransform:
         return image
 
 
-class MixedVisionTextCollator:
+class UnslothVisionDataCollator:
     """
-    Merges text-only and text+image examples in the same batch.
-    Supports multiple images per example and efficiently handles text-only samples.
-
-    Usage:
-      collator = MixedVisionTextCollator(processor, ...)
-      batch = collator(list_of_samples)
+    Enhanced data collator for vision-language models that efficiently handles:
+    - Text-only examples
+    - Single image examples
+    - Multiple images per example
+    - Mixed batches with varying numbers of images
+    
+    Supports models like Qwen-VL, LLaMA-Vision, etc.
     """
     def __init__(
-        self, 
-        processor=None,
-        max_seq_length=1024,
-        pad_token_id=0,
-        pad_to_multiple_of=8,
-        preprocess_images=True,
+        self,
+        processor: AutoProcessor,
+        max_seq_length: int = 2048,
+        pad_token_id: int = 0,
+        label_pad_token_id: int = -100,
+        pad_to_multiple_of: Optional[int] = 8,
+        max_image_size: Optional[int] = None,
+        return_tensors: str = "pt",
     ):
         """
-        :param processor: e.g. Qwen-VL, LlamaVision, etc.
-        :param max_seq_length: max # tokens
-        :param pad_token_id: token ID for text padding
-        :param pad_to_multiple_of: optional multiple for length padding
-        :param preprocess_images: whether to preprocess images using processor
+        Args:
+            processor: HuggingFace processor (e.g. QwenProcessor, LlavaProcessor)
+            max_seq_length: Maximum sequence length for text
+            pad_token_id: Token ID to use for padding text
+            label_pad_token_id: Token ID to use for padding labels (-100 to ignore in loss)
+            pad_to_multiple_of: Optional multiple for padding sequence lengths
+            max_image_size: Optional maximum image size (height/width) for resizing
+            return_tensors: Return format for tensors ("pt" for PyTorch)
         """
         self.processor = processor
         self.max_seq_length = max_seq_length
         self.pad_token_id = pad_token_id
+        self.label_pad_token_id = label_pad_token_id
         self.pad_to_multiple_of = pad_to_multiple_of
-        self.preprocess_images = preprocess_images
+        self.return_tensors = return_tensors
+        
+        # Set up image resizing if specified
+        self.image_transform = None
+        if max_image_size is not None:
+            self.image_transform = ImageResizeTransform(max_image_size)
+            
+        # Try to get image size from model config if not specified
+        elif hasattr(processor, "image_processor") and hasattr(processor.image_processor, "size"):
+            config_size = processor.image_processor.size
+            if isinstance(config_size, (tuple, list)):
+                config_size = config_size["height"]
+            self.image_transform = ImageResizeTransform(config_size)
 
-    def process_images(self, images):
-        """Process a list of images using the processor or return as is."""
+    def _process_images(self, images: List[Union[Image.Image, str, bytes]]) -> List[torch.Tensor]:
+        """Process a list of images, handling various input formats."""
         if not images:
             return []
-        
-        if self.processor is not None and self.preprocess_images:
-            # Process all images in one batch for efficiency
-            processed = self.processor(images=images, return_tensors="pt").pixel_values
-            return [img for img in processed]  # Split back into list
-        else:
-            return images
+            
+        processed_images = []
+        for img in images:
+            # Convert string/bytes to PIL if needed
+            if isinstance(img, (str, bytes)):
+                try:
+                    img = Image.open(img).convert('RGB')
+                except Exception as e:
+                    warnings.warn(f"Failed to load image, skipping: {e}")
+                    continue
+                    
+            # Resize if transform is set
+            if self.image_transform is not None:
+                img = self.image_transform(img)
+                
+            # Let processor handle the rest (normalization etc)
+            processed_images.append(img)
+            
+        if not processed_images:
+            return []
+            
+        # Process all images in one batch for efficiency
+        try:
+            processed = self.processor(images=processed_images, return_tensors=self.return_tensors)
+            return [processed.pixel_values[i] for i in range(len(processed_images))]
+        except Exception as e:
+            warnings.warn(f"Image processing failed: {e}")
+            return []
 
-    def __call__(self, batch):
+    def __call__(self, examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """
+        Collate a batch of examples, handling text and images.
+        
+        Args:
+            examples: List of dicts with keys like "input_ids", "attention_mask", 
+                     "labels", "images" or "pixel_values"
+                     
+        Returns:
+            Batch dict with collated tensors
+        """
+        # Handle text inputs
         input_ids_list = []
         attention_mask_list = []
-        all_pixel_values = []  # Will store all images across batch
-        image_indices = []     # Maps each example to its images' indices
+        labels_list = []
+        
+        # Track images for each example
+        all_pixel_values = []
+        image_indices = []  # Maps each example to its images' indices
         current_image_idx = 0
-
-        for ex in batch:
-            # Handle text fields
+        
+        for ex in examples:
+            # Truncate if needed
             if len(ex["input_ids"]) > self.max_seq_length:
-                ex["input_ids"] = ex["input_ids"][: self.max_seq_length]
-                ex["attention_mask"] = ex["attention_mask"][: self.max_seq_length]
-
+                ex["input_ids"] = ex["input_ids"][:self.max_seq_length]
+                ex["attention_mask"] = ex["attention_mask"][:self.max_seq_length]
+                if "labels" in ex:
+                    ex["labels"] = ex["labels"][:self.max_seq_length]
+                    
+            # Convert to tensors
             input_ids_list.append(torch.tensor(ex["input_ids"], dtype=torch.long))
             attention_mask_list.append(torch.tensor(ex["attention_mask"], dtype=torch.long))
-
-            # Handle image fields - support multiple images per example
+            if "labels" in ex:
+                labels_list.append(torch.tensor(ex["labels"], dtype=torch.long))
+            
+            # Handle images - support multiple sources and formats
             example_images = []
-            if "pixel_values" in ex:
+            
+            # Direct image data
+            if "images" in ex:
+                if isinstance(ex["images"], (list, tuple)):
+                    example_images.extend(ex["images"])
+                else:
+                    example_images.append(ex["images"])
+                    
+            # Pre-processed pixel values
+            elif "pixel_values" in ex:
                 if isinstance(ex["pixel_values"], (list, tuple)):
                     example_images.extend(ex["pixel_values"])
                 else:
                     example_images.append(ex["pixel_values"])
-            
-            # Process images if any
+                    
+            # Process images if any found
             if example_images:
-                processed_images = self.process_images(example_images)
-                all_pixel_values.extend(processed_images)
-                # Store indices for this example's images
-                image_indices.append((current_image_idx, current_image_idx + len(processed_images)))
-                current_image_idx += len(processed_images)
+                processed_images = self._process_images(example_images)
+                if processed_images:  # Only add if processing succeeded
+                    all_pixel_values.extend(processed_images)
+                    image_indices.append((current_image_idx, 
+                                        current_image_idx + len(processed_images)))
+                    current_image_idx += len(processed_images)
+                else:
+                    image_indices.append(None)  # Mark as no images
             else:
-                # No images for this example
-                image_indices.append(None)
-
-        # Pad text
-        input_ids_padded = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
-        attention_mask_padded = pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
-
-        # Optional dimension padding
-        if self.pad_to_multiple_of is not None and self.pad_to_multiple_of > 1:
-            total_len = input_ids_padded.shape[1]
-            remainder = total_len % self.pad_to_multiple_of
-            if remainder != 0:
-                pad_size = self.pad_to_multiple_of - remainder
-                pad_ids = torch.full((input_ids_padded.size(0), pad_size), self.pad_token_id, dtype=torch.long)
-                input_ids_padded = torch.cat([input_ids_padded, pad_ids], dim=1)
-                pad_mask = torch.zeros((attention_mask_padded.size(0), pad_size), dtype=torch.long)
-                attention_mask_padded = torch.cat([attention_mask_padded, pad_mask], dim=1)
-
-        return {
+                image_indices.append(None)  # No images for this example
+        
+        # Pad sequences
+        input_ids_padded = pad_sequence(
+            input_ids_list, 
+            batch_first=True,
+            padding_value=self.pad_token_id
+        )
+        attention_mask_padded = pad_sequence(
+            attention_mask_list,
+            batch_first=True,
+            padding_value=0
+        )
+        
+        # Handle labels if present
+        if labels_list:
+            labels_padded = pad_sequence(
+                labels_list,
+                batch_first=True,
+                padding_value=self.label_pad_token_id
+            )
+        else:
+            labels_padded = None
+            
+        # Optional length padding
+        if self.pad_to_multiple_of and self.pad_to_multiple_of > 1:
+            pad_len = (self.pad_to_multiple_of - 
+                      input_ids_padded.size(1) % self.pad_to_multiple_of)
+            if pad_len != self.pad_to_multiple_of:
+                input_ids_padded = torch.nn.functional.pad(
+                    input_ids_padded,
+                    (0, pad_len),
+                    value=self.pad_token_id
+                )
+                attention_mask_padded = torch.nn.functional.pad(
+                    attention_mask_padded,
+                    (0, pad_len),
+                    value=0
+                )
+                if labels_padded is not None:
+                    labels_padded = torch.nn.functional.pad(
+                        labels_padded,
+                        (0, pad_len),
+                        value=self.label_pad_token_id
+                    )
+        
+        # Build output batch
+        batch = {
             "input_ids": input_ids_padded,
             "attention_mask": attention_mask_padded,
-            "pixel_values": all_pixel_values if all_pixel_values else None,
-            "image_indices": image_indices,  # Maps each example to its images
         }
+        
+        if labels_padded is not None:
+            batch["labels"] = labels_padded
+            
+        if all_pixel_values:
+            batch["pixel_values"] = torch.stack(all_pixel_values)
+            batch["image_indices"] = image_indices
+            
+        return batch
