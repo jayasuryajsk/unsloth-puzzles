@@ -25,6 +25,7 @@ class ImageResizeTransform:
 class MixedVisionTextCollator:
     """
     Merges text-only and text+image examples in the same batch.
+    Supports multiple images per example and efficiently handles text-only samples.
 
     Usage:
       collator = MixedVisionTextCollator(processor, ...)
@@ -36,26 +37,42 @@ class MixedVisionTextCollator:
         max_seq_length=1024,
         pad_token_id=0,
         pad_to_multiple_of=8,
+        preprocess_images=True,
     ):
         """
         :param processor: e.g. Qwen-VL, LlamaVision, etc.
         :param max_seq_length: max # tokens
         :param pad_token_id: token ID for text padding
-        :param pad_to_multiple_of: optional multiple for length padding 
+        :param pad_to_multiple_of: optional multiple for length padding
+        :param preprocess_images: whether to preprocess images using processor
         """
         self.processor = processor
         self.max_seq_length = max_seq_length
         self.pad_token_id = pad_token_id
         self.pad_to_multiple_of = pad_to_multiple_of
+        self.preprocess_images = preprocess_images
+
+    def process_images(self, images):
+        """Process a list of images using the processor or return as is."""
+        if not images:
+            return []
+        
+        if self.processor is not None and self.preprocess_images:
+            # Process all images in one batch for efficiency
+            processed = self.processor(images=images, return_tensors="pt").pixel_values
+            return [img for img in processed]  # Split back into list
+        else:
+            return images
 
     def __call__(self, batch):
         input_ids_list = []
         attention_mask_list = []
-        pixel_values_list = []
-        has_image_flags = []
+        all_pixel_values = []  # Will store all images across batch
+        image_indices = []     # Maps each example to its images' indices
+        current_image_idx = 0
 
         for ex in batch:
-            # text fields
+            # Handle text fields
             if len(ex["input_ids"]) > self.max_seq_length:
                 ex["input_ids"] = ex["input_ids"][: self.max_seq_length]
                 ex["attention_mask"] = ex["attention_mask"][: self.max_seq_length]
@@ -63,29 +80,30 @@ class MixedVisionTextCollator:
             input_ids_list.append(torch.tensor(ex["input_ids"], dtype=torch.long))
             attention_mask_list.append(torch.tensor(ex["attention_mask"], dtype=torch.long))
 
-            # image field
+            # Handle image fields - support multiple images per example
+            example_images = []
             if "pixel_values" in ex:
-                # if user already has a Tensor or PIL
-                if isinstance(ex["pixel_values"], torch.Tensor):
-                    pixel_values_list.append(ex["pixel_values"])
+                if isinstance(ex["pixel_values"], (list, tuple)):
+                    example_images.extend(ex["pixel_values"])
                 else:
-                    # Use self.processor if we want e.g. normalization
-                    # Or just store the raw
-                    if self.processor is not None:
-                        pixel = self.processor(images=ex["pixel_values"], return_tensors="pt").pixel_values[0]
-                    else:
-                        pixel = ex["pixel_values"]  # e.g. a PIL or array
-                    pixel_values_list.append(pixel)
-                has_image_flags.append(True)
+                    example_images.append(ex["pixel_values"])
+            
+            # Process images if any
+            if example_images:
+                processed_images = self.process_images(example_images)
+                all_pixel_values.extend(processed_images)
+                # Store indices for this example's images
+                image_indices.append((current_image_idx, current_image_idx + len(processed_images)))
+                current_image_idx += len(processed_images)
             else:
-                pixel_values_list.append(None)
-                has_image_flags.append(False)
+                # No images for this example
+                image_indices.append(None)
 
-        # pad text
+        # Pad text
         input_ids_padded = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
         attention_mask_padded = pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
 
-        # optionally pad dimension
+        # Optional dimension padding
         if self.pad_to_multiple_of is not None and self.pad_to_multiple_of > 1:
             total_len = input_ids_padded.shape[1]
             remainder = total_len % self.pad_to_multiple_of
@@ -99,6 +117,6 @@ class MixedVisionTextCollator:
         return {
             "input_ids": input_ids_padded,
             "attention_mask": attention_mask_padded,
-            "pixel_values_list": pixel_values_list,
-            "has_image_flags": has_image_flags,
+            "pixel_values": all_pixel_values if all_pixel_values else None,
+            "image_indices": image_indices,  # Maps each example to its images
         }
